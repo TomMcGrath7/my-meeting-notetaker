@@ -147,13 +147,30 @@ def _first(d: dict, *keys, default=None):
             return d[k]
     return default
 
+def _extract_json(raw: str):
+    """Decode the first JSON value embedded in `raw`.
+
+    `speech` prints human progress ("Loading audio…", "[62%] Downloading…",
+    "Running diarization…") to STDOUT *before* the JSON, so the captured output
+    is progress-text-then-JSON, not pure JSON. Skip to the first '{' or '[' and
+    raw_decode from there, ignoring any trailing text.
+    """
+    for i, ch in enumerate(raw):
+        if ch in "{[":
+            try:
+                obj, _ = json.JSONDecoder().raw_decode(raw, i)
+                return obj
+            except json.JSONDecodeError:
+                continue
+    raise json.JSONDecodeError("no JSON value found in output", raw, 0)
+
 def parse_diarize(raw: str) -> list[Turn]:
     """
     Tolerant parser for `speech diarize --json`. Accepts a top-level list, or a
     dict wrapping the list under common keys, and normalises speaker/time keys.
     If your build emits different field names, this is the one place to adjust.
     """
-    data = json.loads(raw)
+    data = _extract_json(raw)
     if isinstance(data, dict):
         data = _first(data, "segments", "turns", "diarization", "results", default=data)
     turns: list[Turn] = []
@@ -189,29 +206,30 @@ def run_align(wav: Path, model: str, language: str | None) -> str:
     return sh(cmd)
 
 def parse_align(raw: str) -> list[Word]:
+    # The real `speech align` output is one bracketed line per word, e.g.
+    #   [0.16s - 2.24s] Blah,
+    # preceded by progress + a "Transcription: …" line (neither matches _ALIGN_RE).
     words: list[Word] = []
-    # Try JSON first in case your build supports it; fall back to line format.
-    stripped = raw.strip()
-    if stripped.startswith("{") or stripped.startswith("["):
-        try:
-            data = json.loads(stripped)
-            if isinstance(data, dict):
-                data = _first(data, "words", "alignment", "segments", default=[])
-            for w in data:
-                words.append(Word(
-                    text=str(_first(w, "text", "word", "token", default="")).strip(),
-                    start=float(_first(w, "start", "startTime", "start_time", default=0.0)),
-                    end=float(_first(w, "end", "endTime", "end_time", default=0.0)),
-                ))
-            if words:
-                return words
-        except json.JSONDecodeError:
-            pass
     for line in raw.splitlines():
         m = _ALIGN_RE.search(line)
         if m:
             words.append(Word(text=m.group(3).strip(),
                               start=float(m.group(1)), end=float(m.group(2))))
+    if words:
+        return words
+    # Fallback: a future build may emit JSON (possibly behind progress text).
+    try:
+        data = _extract_json(raw)
+    except json.JSONDecodeError:
+        return words
+    if isinstance(data, dict):
+        data = _first(data, "words", "alignment", "segments", default=[])
+    for w in data:
+        words.append(Word(
+            text=str(_first(w, "text", "word", "token", default="")).strip(),
+            start=float(_first(w, "start", "startTime", "start_time", default=0.0)),
+            end=float(_first(w, "end", "endTime", "end_time", default=0.0)),
+        ))
     return words
 
 # --------------------------------------------------------------------------- #
