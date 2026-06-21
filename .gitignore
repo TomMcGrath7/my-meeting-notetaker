@@ -1,3 +1,19 @@
+# --- sensitive: never commit (private meeting content) ---
+# real participant names + meeting context, and per-meeting configs
+config.yaml
+config.*.yaml
+# ...but DO track the template
+!config.example.yaml
+# transcripts + notes, incl. timestamped out-dirs from scripts/process.sh
+out/
+out-*/
+# recordings + intermediates
+*.wav
+*.m4a
+*.mp3
+*.caf
+pipeline.json
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
