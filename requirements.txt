@@ -1,0 +1,3 @@
+# Only third-party dep; everything else is Python stdlib.
+# (ffmpeg and the `speech` binary are installed via Homebrew, not pip.)
+PyYAML>=6.0

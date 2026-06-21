@@ -1,0 +1,19 @@
+# Rename to config.yaml (or keep several, one per recurring meeting).
+# Everything here is fed to the LLM that maps anonymous SPEAKER_xx labels to
+# real people and writes the notes. The richer the context, the better the
+# attribution — roles and who-does-what matter more than anything clever.
+
+participants:
+  - Tom
+  - Marina
+  - Viswa
+
+# Free text. Mention roles, the meeting's purpose, who tends to ask vs. answer,
+# any self-introductions, accents/phone-vs-room audio, recurring topics, etc.
+context: |
+  Weekly sync. Tom is the technical lead and runs the agenda — he tends to
+  walk through status and propose next steps. Viswa is the client (UK
+  compliance SaaS) and mostly asks questions about scope, timeline and cost.
+  Marina joins occasionally and is dialing in from a phone, so her audio is
+  thinner than the others. Topics this week: API hardening sprint, launch
+  timeline, invoicing.
