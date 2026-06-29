@@ -30,6 +30,7 @@ import re
 import shutil
 import subprocess
 import sys
+import wave
 import urllib.request
 import urllib.error
 from dataclasses import dataclass, asdict, field
@@ -199,11 +200,69 @@ def _norm_label(s: str) -> str:
 # matches lines like:  [12.34s - 12.81s] hello
 _ALIGN_RE = re.compile(r"\[\s*([\d.]+)\s*s?\s*-\s*([\d.]+)\s*s?\s*\]\s*(.+?)\s*$")
 
-def run_align(wav: Path, model: str, language: str | None) -> str:
+# speech align — whether it transcribes or force-aligns provided --text — only
+# handles a few minutes of audio per call. On a long recording it crushes every
+# word timestamp into the first ~2 minutes (verified on a 58-min file: 9k words
+# all squashed into 136-232s). So we slice the audio into windows this long,
+# align each, and shift the timestamps back onto the real timeline.
+ALIGN_CHUNK_SECONDS = 300.0
+
+def _wav_duration(wav: Path) -> float:
+    with wave.open(str(wav), "rb") as w:
+        return w.getnframes() / float(w.getframerate())
+
+def _cut_wav(wav: Path, start: float, length: float, out: Path) -> Path:
+    sh(["ffmpeg", "-y", "-ss", f"{start:.3f}", "-t", f"{length:.3f}",
+        "-i", str(wav), "-ac", "1", "-ar", "16000", "-f", "wav", str(out)],
+       capture=True)
+    return out
+
+def run_align(wav: Path, model: str, language: str | None,
+              transcript: str | None = None) -> str:
+    """One `speech align` call. With `transcript`, switches to forced alignment
+    (--text), which skips ASR and so isn't bound by the ASR --max-tokens cap."""
     cmd = ["speech", "align", str(wav), "--model", model]
     if language:
         cmd += ["--language", language]
+    if transcript:
+        cmd += ["--text", transcript]
     return sh(cmd)
+
+def align_words(wav: Path, model: str, language: str | None,
+                transcript: str | None = None,
+                chunk_seconds: float = ALIGN_CHUNK_SECONDS,
+                progress=None) -> list[Word]:
+    """Word-level timestamps for the whole file, chunking long audio (see note
+    on ALIGN_CHUNK_SECONDS). With a `transcript` (e.g. exported from Voice
+    Memos), each chunk is force-aligned against its share of the text, split in
+    proportion to chunk duration — best-effort, since the source text is untimed.
+    """
+    dur = _wav_duration(wav)
+    if dur <= chunk_seconds + 1.0:
+        return parse_align(run_align(wav, model, language, transcript))
+
+    n = int(dur // chunk_seconds) + (1 if dur % chunk_seconds else 0)
+    text_words = transcript.split() if transcript else None
+    words: list[Word] = []
+    tmp = wav.parent / "_align_chunk.wav"
+    for i in range(n):
+        start = i * chunk_seconds
+        length = min(chunk_seconds, dur - start)
+        _cut_wav(wav, start, length, tmp)
+        slice_text = None
+        if text_words is not None:
+            a = (i * len(text_words)) // n
+            b = ((i + 1) * len(text_words)) // n
+            slice_text = " ".join(text_words[a:b]) or None
+        for w in parse_align(run_align(tmp, model, language, slice_text)):
+            words.append(Word(text=w.text, start=w.start + start, end=w.end + start))
+        if progress:
+            progress(i + 1, n, len(words))
+    try:
+        tmp.unlink()
+    except OSError:
+        pass
+    return words
 
 def parse_align(raw: str) -> list[Word]:
     # The real `speech align` output is one bracketed line per word, e.g.
@@ -300,16 +359,23 @@ def llm(messages: list[dict], system: str, *, backend: str, model: str,
         data = _post(url, body, headers)
         return data["choices"][0]["message"]["content"]
 
-def _post(url: str, body: dict, headers: dict) -> dict:
+def _post(url: str, body: dict, headers: dict, timeout: int = 600) -> dict:
+    # Local models (e.g. a 30B via Ollama) can cold-load for a minute+ before
+    # the first token, so the timeout is generous and a lone read-timeout (a
+    # transient, not a real failure) is retried once before giving up.
     req = urllib.request.Request(url, data=json.dumps(body).encode(),
                                  headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=180) as r:
-            return json.loads(r.read().decode())
-    except urllib.error.HTTPError as e:
-        sys.exit(f"LLM HTTP {e.code}: {e.read().decode()[:500]}")
-    except urllib.error.URLError as e:
-        sys.exit(f"LLM connection error: {e.reason}")
+    for attempt in (1, 2):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            sys.exit(f"LLM HTTP {e.code}: {e.read().decode()[:500]}")
+        except (TimeoutError, OSError) as e:  # incl. socket.timeout (py3.9)
+            if attempt == 2:
+                reason = getattr(e, "reason", e)
+                sys.exit(f"LLM connection error after retry: {reason}")
+            print("  LLM timed out; retrying once…", file=sys.stderr)
 
 def _strip_fences(s: str) -> str:
     s = s.strip()
@@ -341,20 +407,60 @@ Respond with ONLY a JSON object, no prose, no markdown fences:
 
 def label_and_correct(segs: list[Segment], roster: list[str], context: str,
                       **llm_kw) -> tuple[dict[str, str], list[dict]]:
-    lines = [f"[{i}] {s.speaker} ({s.start:.1f}-{s.end:.1f}s): {s.text}"
+    # Truncate each segment: attribution needs identity signal, not every word.
+    # On a long meeting the full text buries the instruction and weaker local
+    # models start summarising instead of emitting the label JSON.
+    def clip(t: str, n: int = 240) -> str:
+        return (t[:n] + "…") if len(t) > n else t
+    labels = sorted({s.speaker for s in segs})
+    allowed = ", ".join(f'"{r}"' for r in roster)
+    lines = [f"[{i}] {s.speaker} ({s.start:.0f}s): {clip(s.text)}"
              for i, s in enumerate(segs)]
-    user = (f"PARTICIPANTS: {', '.join(roster)}\n\n"
+    user = (f"PARTICIPANTS (the ONLY allowed names): {allowed}\n\n"
             f"CONTEXT:\n{context}\n\n"
-            f"TRANSCRIPT:\n" + "\n".join(lines))
+            f"SPEAKER LABELS TO MAP: {', '.join(labels)}\n\n"
+            f"TRANSCRIPT ({len(segs)} segments):\n" + "\n".join(lines) +
+            f"\n\nNow output ONLY the JSON object. Every label in "
+            f"[{', '.join(labels)}] must appear in label_map, and every value MUST "
+            f"be exactly one of: {allowed}. No other names, no other languages, "
+            f"no prose, no markdown.")
     out = llm([{"role": "user", "content": user}], LABEL_SYSTEM,
               max_tokens=2000, **llm_kw)
     try:
-        data = json.loads(_strip_fences(out))
+        data = _extract_json(out)            # tolerant: skips prose/fences
     except json.JSONDecodeError:
         print("warning: could not parse LLM label JSON; leaving raw labels.",
               file=sys.stderr)
         return {}, []
-    return data.get("label_map", {}), data.get("flagged", [])
+    # Validate every mapped name against the roster (case-insensitive). Drop
+    # anything off-roster so a hallucinated/foreign name never reaches the
+    # transcript — that label just stays raw (visibly unattributed).
+    canon = {r.lower(): r for r in roster}
+    label_map: dict[str, str] = {}
+    for k, v in (data.get("label_map") or {}).items():
+        if isinstance(v, str) and v.strip().lower() in canon:
+            label_map[k] = canon[v.strip().lower()]
+    flagged = data.get("flagged") or data.get("flagged_segments") or []
+    return label_map, flagged
+
+def fill_unmapped(segs: list[Segment], roster: list[str]) -> int:
+    """Safety net for diarizer over-splitting: any segment still bearing a raw
+    SPEAKER_xx label (the LLM skipped a tiny stray cluster) inherits the
+    nearest-in-time roster-named segment, flagged uncertain. Guarantees no raw
+    labels ever reach the transcript. Returns how many were filled."""
+    named = [i for i, s in enumerate(segs) if s.speaker in roster]
+    if not named:
+        return 0
+    filled = 0
+    for i, s in enumerate(segs):
+        if s.speaker in roster:
+            continue
+        j = min(named, key=lambda k: abs(k - i))   # segments are time-ordered
+        raw, s.speaker = s.speaker, segs[j].speaker
+        s.flagged = True
+        s.flag_reason = s.flag_reason or f"over-split {raw} merged into nearest speaker"
+        filled += 1
+    return filled
 
 NOTES_SYSTEM = """You write concise, accurate meeting notes from a speaker-attributed
 transcript. Use only what is in the transcript — never invent commitments. Output
@@ -410,11 +516,21 @@ def cmd_check(args):
     print(f"\n--> parsed {len(turns)} turns; first 5:")
     for t in turns[:5]:
         print(f"    {t.speaker}  {t.start:.2f}-{t.end:.2f}")
-    print("\n=== speech align (raw, first 800 chars) ===")
-    raw_a = run_align(wav, args.model, args.language)
+    # Align just the first chunk: enough to confirm the line format, and avoids
+    # both the slow full-file pass and the long-audio timestamp squashing (the
+    # real `run` chunks the whole file — see align_words / ALIGN_CHUNK_SECONDS).
+    dur = _wav_duration(wav)
+    if dur > ALIGN_CHUNK_SECONDS + 1.0:
+        _cut_wav(wav, 0.0, ALIGN_CHUNK_SECONDS, Path("/tmp/_check_chunk.wav"))
+        print(f"\n=== speech align (raw, first 800 chars; first "
+              f"{int(ALIGN_CHUNK_SECONDS)}s chunk of {dur/60:.0f} min) ===")
+        raw_a = run_align(Path("/tmp/_check_chunk.wav"), args.model, args.language)
+    else:
+        print("\n=== speech align (raw, first 800 chars) ===")
+        raw_a = run_align(wav, args.model, args.language)
     print(raw_a[:800])
     words = parse_align(raw_a)
-    print(f"\n--> parsed {len(words)} words; first 10:")
+    print(f"\n--> parsed {len(words)} words (this chunk); first 10:")
     print("    " + " ".join(w.text for w in words[:10]))
     if not turns or not words:
         print("\n*** A parser returned nothing. Adjust parse_diarize/parse_align "
@@ -442,8 +558,20 @@ def cmd_run(args):
         turns = parse_diarize(run_diarize(wav, args.diarize_engine, args.vad_filter))
         print(f"  {len(turns)} turns, "
               f"{len({t.speaker for t in turns})} apparent speakers")
-        print("• aligning words…")
-        words = parse_align(run_align(wav, args.model, args.language))
+        transcript_text = None
+        if getattr(args, "transcript", None):
+            transcript_text = Path(args.transcript).read_text().strip() or None
+        dur = _wav_duration(wav)
+        if dur > args.align_chunk + 1.0:
+            n = int(dur // args.align_chunk) + (1 if dur % args.align_chunk else 0)
+            mode = "forced-align" if transcript_text else "transcribe"
+            print(f"• aligning words… ({dur/60:.0f} min → {n} chunks, {mode})")
+        else:
+            print("• aligning words…")
+        words = align_words(wav, args.model, args.language,
+                            transcript=transcript_text,
+                            chunk_seconds=args.align_chunk,
+                            progress=lambda i, n, t: print(f"  chunk {i}/{n} … {t} words"))
         print(f"  {len(words)} words")
         if not turns or not words:
             sys.exit("error: diarization or alignment produced nothing. "
@@ -458,15 +586,20 @@ def cmd_run(args):
         print("• attributing speakers via LLM…")
         label_map, flagged = label_and_correct(pipe.segments, roster, context, **llm_kw)
         pipe.label_map = label_map
+        canon = {r.lower(): r for r in roster}
         flag_by_idx = {f["index"]: f for f in flagged if "index" in f}
         for i, s in enumerate(pipe.segments):
+            s.speaker = label_map.get(s.speaker, s.speaker)
             if i in flag_by_idx:
                 s.flagged = True
                 s.flag_reason = flag_by_idx[i].get("reason", "")
                 sug = flag_by_idx[i].get("suggested_speaker")
-                s.speaker = sug or label_map.get(s.speaker, s.speaker)
-            else:
-                s.speaker = label_map.get(s.speaker, s.speaker)
+                if isinstance(sug, str) and sug.strip().lower() in canon:
+                    s.speaker = canon[sug.strip().lower()]   # only roster names
+        n_filled = fill_unmapped(pipe.segments, roster)
+        named = len({s.speaker for s in pipe.segments if s.speaker in roster})
+        print(f"  {named} named speaker(s)"
+              + (f"; {n_filled} over-split segment(s) merged to nearest" if n_filled else ""))
     else:
         print("• no participants in config — skipping LLM attribution.")
 
@@ -517,6 +650,15 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--out-dir", default="./out")
     r.add_argument("--denoise", action="store_true",
                    help="run speech denoise first (good for noisy calls)")
+    r.add_argument("--transcript",
+                   help="path to an existing transcript (e.g. exported from "
+                        "Voice Memos); force-align THIS text to the audio instead "
+                        "of transcribing. Better text, but best-effort across "
+                        "chunks since the source text is untimed.")
+    r.add_argument("--align-chunk", type=float, default=ALIGN_CHUNK_SECONDS,
+                   help=f"seconds of audio per alignment chunk (default "
+                        f"{int(ALIGN_CHUNK_SECONDS)}). speech align only handles a "
+                        f"few minutes per call, so long files are chunked + stitched.")
     r.add_argument("--no-notes", action="store_true",
                    help="skip the notes-generation LLM step")
     r.add_argument("--from-json",
