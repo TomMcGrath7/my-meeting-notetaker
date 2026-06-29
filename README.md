@@ -100,6 +100,26 @@ python3 notetaker.py run call.m4a --denoise --language nl
 python3 notetaker.py run --from-json out/pipeline.json --config config.yaml
 ```
 
+Prefer not to touch the command line? See **Front-ends** below — the DropMemo
+app and a Shortcut both wrap this so you only ever drag in a file.
+
+### Long meetings (chunking)
+
+`speech align` — whether it transcribes or force-aligns — only handles a few
+minutes of audio per call; on a long recording it silently squashes every word
+timestamp into the first ~2 minutes. notetaker works around this automatically:
+it slices the audio into `--align-chunk` windows (default 300s), aligns each,
+and stitches the timestamps back together. You don't have to do anything; just
+know an hour-long file means ~12 alignment passes.
+
+If you already have a transcript (e.g. exported from Voice Memos), hand it over
+and notetaker **force-aligns** it instead of transcribing — better text, and it
+skips ASR entirely:
+
+```bash
+python3 notetaker.py run meeting.m4a --transcript voice-memo.txt
+```
+
 ### Outputs (`./out/`)
 
 | file | what |
@@ -135,10 +155,59 @@ just two separate invocations on `--from-json`.
   ANE, faster — but its CoreML model fails on some macOS/Silicon setups and
   silently returns zero speakers, so confirm with `check` before relying on
   it). If one over-splits a speaker, try the other — the LLM merges duplicates.
+- **Over-splitting:** the diarizer often splits one voice into several
+  `SPEAKER_xx` clusters (a 3-person call came out as 8). The LLM relabel merges
+  them back to your roster, and any stray fragment it misses is reassigned to
+  the nearest named speaker and flagged `⚠️`. To cut it at the source, lower
+  `--cluster-threshold` (speech default 0.715; lower = fewer speakers) toward
+  your known head count.
 - **ASR size:** `--model 0.6B` is faster, `1.7B` (default) more accurate.
 - **Bad attribution?** The single biggest lever is the `context:` block — add
   roles and who-asks-vs-answers. The model is told to *flag* rather than guess
-  when unsure, so trust the `⚠️` marks and skim those in the audio.
+  when unsure, so trust the `⚠️` marks and skim those in the audio. The roster
+  in `participants:` is enforced — the LLM can only assign those names.
+- **Local model choice:** any 14B+ instruction-follower works for attribution +
+  notes (`--model-llm` / `OLLAMA_MODEL`). A general *instruct* model tends to
+  follow the strict label format better than a coding model.
 - **Schema drift:** if a future `speech` release changes the JSON/line format,
   `check` will show it and you adjust `parse_diarize` / `parse_align` — the two
   functions are isolated and commented for exactly this.
+
+## Front-ends
+
+So you never deal with paths, three layers all call the **same**
+`scripts/process.sh` (local-Ollama defaults + a timestamped out-dir):
+
+**`scripts/process.sh`** — the single source of truth. Pass an audio file plus
+any extra `notetaker.py` flags:
+
+```bash
+scripts/process.sh "~/Desktop/Weekly sync.m4a"            # uses your defaults
+scripts/process.sh call.m4a --denoise --cluster-threshold 0.55
+```
+
+Override via env: `OLLAMA_MODEL`, `OLLAMA_URL`, `LLM_BACKEND`, `OUT_ROOT`.
+
+**DropMemo** (macOS app) — one window: drag a memo onto it (or use the file
+picker), pick the backend/model/denoise/diarize-engine, watch the pipeline
+stream live, and on completion it reveals the out-dir and opens `notes.md`.
+Build it without Xcode:
+
+```bash
+scripts/build_dropmemo.sh          # → build/DropMemo.app (swiftc, ad-hoc signed)
+open build/DropMemo.app            # or: cp -R build/DropMemo.app /Applications/
+```
+
+It registers as a handler for `.m4a/.wav/.mp3`, so **Open With ▸ DropMemo** and
+dropping a memo on its Dock icon both work.
+
+**Shortcut (no Xcode needed)** — make a Shortcut that **Receives audio**, then
+**Run Shell Script** with:
+
+```bash
+/path/to/my-meeting-notetaker/scripts/process.sh "$1"
+```
+
+Because it accepts audio, it appears in the Voice Memos **Share** sheet — share
+a memo straight to it. (Drag-and-drop out of Voice Memos onto DropMemo is still
+the most reliable route, since it yields a properly titled file.)
