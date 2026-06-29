@@ -1,8 +1,8 @@
 // DropMemo — a thin SwiftUI front-end over scripts/process.sh.
 //
-// One window: drag a recording in (or pick one), tweak a couple of controls,
-// watch the pipeline's stdout stream live, and on success the out-dir is
-// revealed in Finder with notes.md opened. It is deliberately NOT a
+// One window: drag a recording in (or pick one), set who was in the meeting and
+// the controls, watch the pipeline's stdout stream live, and on success the
+// out-dir is revealed in Finder with notes.md opened. It is deliberately NOT a
 // reimplementation of the pipeline — every run shells out to scripts/process.sh
 // (the single source of truth) so the app and the Voice Memos Shortcut behave
 // identically.
@@ -15,7 +15,7 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 
-// MARK: - Where the repo (and thus process.sh) lives
+// MARK: - Where the repo (and thus process.sh + config.yaml) lives
 
 enum Repo {
     /// Resolution order: DROPMEMO_REPO env → Info.plist "DMRepoPath" (baked in
@@ -32,6 +32,7 @@ enum Repo {
     }
 
     static var processSh: String { path + "/scripts/process.sh" }
+    static var configPath: String { path + "/config.yaml" }
 }
 
 // MARK: - Controls
@@ -66,7 +67,14 @@ final class PipelineModel: ObservableObject {
     @Published var denoise = false
     @Published var diarize: DiarizeEngine = .pyannote
 
+    // Meeting roster — written to config.yaml on each run (the pipeline reads it
+    // to name speakers). Comma- or newline-separated names.
+    @Published var participants: String = ""
+    @Published var context: String = ""
+
     private var task: Process?
+
+    init() { loadConfig() }
 
     /// Default model name to show when the backend toggles.
     func backendChanged() {
@@ -81,6 +89,51 @@ final class PipelineModel: ObservableObject {
         appendLine("• selected \(url.lastPathComponent)")
     }
 
+    // MARK: config.yaml <-> UI
+
+    /// Minimal reader for the `participants:` list and `context: |` block this
+    /// app writes (and the example file). Not a general YAML parser.
+    func loadConfig() {
+        guard let text = try? String(contentsOfFile: Repo.configPath, encoding: .utf8) else { return }
+        var names: [String] = []
+        var ctx: [String] = []
+        var inCtx = false
+        for raw in text.components(separatedBy: "\n") {
+            if inCtx {
+                if raw.hasPrefix("  ") { ctx.append(String(raw.dropFirst(2))); continue }
+                if raw.trimmingCharacters(in: .whitespaces).isEmpty { ctx.append(""); continue }
+                inCtx = false
+            }
+            let t = raw.trimmingCharacters(in: .whitespaces)
+            if t.hasPrefix("- ") {
+                names.append(String(t.dropFirst(2)).trimmingCharacters(in: .whitespaces))
+            } else if t.hasPrefix("context:") {
+                inCtx = true
+            }
+        }
+        if !names.isEmpty { participants = names.joined(separator: ", ") }
+        let c = ctx.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        if !c.isEmpty { context = c }
+    }
+
+    /// Write the roster fields back to config.yaml so the pipeline picks them up.
+    func writeConfig() {
+        let names = participants
+            .split(whereSeparator: { $0 == "," || $0 == "\n" })
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        var y = "# Written by DropMemo. Edit here or in the app.\nparticipants:\n"
+        for n in names { y += "  - \(n)\n" }
+        let ctx = context.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !ctx.isEmpty {
+            y += "context: |\n"
+            for line in ctx.components(separatedBy: "\n") { y += "  \(line)\n" }
+        }
+        try? y.write(toFile: Repo.configPath, atomically: true, encoding: .utf8)
+    }
+
+    // MARK: run
+
     func run() {
         guard let audio = audioURL, !isRunning else { return }
         guard FileManager.default.isExecutableFile(atPath: Repo.processSh) else {
@@ -89,6 +142,7 @@ final class PipelineModel: ObservableObject {
             return
         }
 
+        writeConfig()            // roster fields → config.yaml before the run
         log = ""
         isRunning = true
         lastOutDir = nil
@@ -119,7 +173,6 @@ final class PipelineModel: ObservableObject {
             guard !data.isEmpty, let chunk = String(data: data, encoding: .utf8) else { return }
             Task { @MainActor in PipelineModel.shared.append(chunk) }
         }
-
         proc.terminationHandler = { p in
             Task { @MainActor in PipelineModel.shared.finished(status: p.terminationStatus) }
         }
@@ -157,8 +210,7 @@ final class PipelineModel: ObservableObject {
 
     private func reveal(_ outDir: String) {
         let notes = outDir + "/notes.md"
-        let fm = FileManager.default
-        if fm.fileExists(atPath: notes) {
+        if FileManager.default.fileExists(atPath: notes) {
             NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: notes)])
             NSWorkspace.shared.open(URL(fileURLWithPath: notes))
         } else {
@@ -179,12 +231,13 @@ struct ContentView: View {
     var body: some View {
         VStack(spacing: 12) {
             dropZone
+            roster
             controls
             logView
             statusBar
         }
         .padding(16)
-        .frame(minWidth: 560, minHeight: 520)
+        .frame(minWidth: 580, minHeight: 640)
     }
 
     private var dropZone: some View {
@@ -198,20 +251,42 @@ struct ContentView: View {
                 )
             VStack(spacing: 6) {
                 Image(systemName: "waveform")
-                    .font(.system(size: 34))
+                    .font(.system(size: 30))
                     .foregroundColor(.secondary)
                 Text(m.audioURL?.lastPathComponent ?? "Drag a Voice Memo here")
                     .font(.headline)
-                Text("or")
-                    .foregroundColor(.secondary).font(.caption)
+                Text("or").foregroundColor(.secondary).font(.caption)
                 Button("Choose file…") { pickFile() }
             }
             .padding()
         }
-        .frame(height: 150)
-        .onDrop(of: [UTType.fileURL], isTargeted: $dropHighlight) { providers in
+        .frame(height: 130)
+        // Accept broadly (.item) so file *promises* from Voice Memos register —
+        // a plain fileURL filter silently rejects them.
+        .onDrop(of: [.fileURL, .audio, .item], isTargeted: $dropHighlight) { providers in
             handleDrop(providers)
         }
+    }
+
+    private var roster: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Who's in the meeting  (saved to config.yaml)")
+                .font(.caption).foregroundColor(.secondary)
+            TextField("Participants, comma-separated (e.g. Tom, Olly)", text: $m.participants)
+                .textFieldStyle(.roundedBorder)
+            TextEditor(text: $m.context)
+                .font(.system(.caption, design: .default))
+                .frame(height: 56)
+                .overlay(RoundedRectangle(cornerRadius: 5).stroke(.secondary.opacity(0.3)))
+                .overlay(alignment: .topLeading) {
+                    if m.context.isEmpty {
+                        Text("Optional context: roles, who dials in, recurring topics…")
+                            .font(.caption).foregroundColor(.secondary)
+                            .padding(.horizontal, 5).padding(.vertical, 4).allowsHitTesting(false)
+                    }
+                }
+        }
+        .disabled(m.isRunning)
     }
 
     private var controls: some View {
@@ -224,7 +299,7 @@ struct ContentView: View {
 
             TextField("model", text: $m.model)
                 .textFieldStyle(.roundedBorder)
-                .frame(minWidth: 150)
+                .frame(minWidth: 140)
 
             Toggle("Denoise", isOn: $m.denoise)
 
@@ -276,12 +351,39 @@ struct ContentView: View {
     // MARK: drop / pick
 
     private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
-        guard let provider = providers.first else { return false }
-        _ = provider.loadObject(ofClass: URL.self) { url, _ in
-            guard let url, url.isFileURL else { return }
-            Task { @MainActor in PipelineModel.shared.accept(url) }
+        guard let p = providers.first else { return false }
+        // Prefer a real file representation: this materializes file *promises*
+        // (how Voice Memos vends a recording) into a temp file, not just plain
+        // file-URL drags. Pick an audio-conforming type id, else a file-url.
+        let ids = p.registeredTypeIdentifiers
+        let fileId = ids.first { UTType($0)?.conforms(to: .audio) == true }
+                  ?? ids.first { $0 == UTType.fileURL.identifier }
+        if let id = fileId {
+            p.loadFileRepresentation(forTypeIdentifier: id) { url, _ in
+                guard let url, let stable = Self.intoInbox(url) else { return }
+                Task { @MainActor in PipelineModel.shared.accept(stable) }
+            }
+            return true
         }
-        return true
+        if p.canLoadObject(ofClass: URL.self) {       // Finder file drag
+            _ = p.loadObject(ofClass: URL.self) { url, _ in
+                guard let url, url.isFileURL else { return }
+                Task { @MainActor in PipelineModel.shared.accept(url) }
+            }
+            return true
+        }
+        return false
+    }
+
+    /// The URL from loadFileRepresentation is temporary and deleted once the
+    /// handler returns, so copy it somewhere stable before using it.
+    private static func intoInbox(_ src: URL) -> URL? {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("DropMemo", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let dest = dir.appendingPathComponent(src.lastPathComponent)
+        try? FileManager.default.removeItem(at: dest)
+        do { try FileManager.default.copyItem(at: src, to: dest); return dest }
+        catch { return nil }
     }
 
     private func pickFile() {

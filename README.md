@@ -189,9 +189,10 @@ scripts/process.sh call.m4a --denoise --cluster-threshold 0.55
 Override via env: `OLLAMA_MODEL`, `OLLAMA_URL`, `LLM_BACKEND`, `OUT_ROOT`.
 
 **DropMemo** (macOS app) — one window: drag a memo onto it (or use the file
-picker), pick the backend/model/denoise/diarize-engine, watch the pipeline
-stream live, and on completion it reveals the out-dir and opens `notes.md`.
-Build it without Xcode:
+picker), set **who's in the meeting** (the participants + context fields write
+straight to `config.yaml`, and are pre-filled from it on launch), pick the
+backend/model/denoise/diarize-engine, watch the pipeline stream live, and on
+completion it reveals the out-dir and opens `notes.md`. Build it without Xcode:
 
 ```bash
 scripts/build_dropmemo.sh          # → build/DropMemo.app (swiftc, ad-hoc signed)
