@@ -13,6 +13,7 @@
 
 import SwiftUI
 import AppKit
+import Darwin
 import UniformTypeIdentifiers
 
 // MARK: - Where the repo (and thus process.sh + config.yaml) lives
@@ -73,6 +74,7 @@ final class PipelineModel: ObservableObject {
     @Published var model: String = "qwen3-coder:latest"
     @Published var denoise = false
     @Published var diarize: DiarizeEngine = .pyannote
+    @Published var asrModel: String = "1.7B"          // 0.6B = faster, 1.7B = accurate
 
     // Meeting roster — written to config.yaml on each run (the pipeline reads it
     // to name speakers). Comma- or newline-separated names.
@@ -80,6 +82,7 @@ final class PipelineModel: ObservableObject {
     @Published var context: String = ""
 
     private var task: Process?
+    private var stopped = false
 
     init() { loadConfig() }
 
@@ -153,6 +156,7 @@ final class PipelineModel: ObservableObject {
         writeConfig()            // roster fields → config.yaml before the run
         log = ""
         isRunning = true
+        stopped = false
         lastOutDir = nil
 
         // Map the controls onto process.sh's interface.
@@ -167,6 +171,7 @@ final class PipelineModel: ObservableObject {
         }
         if denoise { args.append("--denoise") }
         args += ["--diarize-engine", diarize.rawValue]
+        args += ["--model", asrModel]                // ASR/align size (0.6B|1.7B)
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/bash")
@@ -195,11 +200,40 @@ final class PipelineModel: ObservableObject {
         }
     }
 
+    /// Stop a run: SIGTERM the whole process tree (bash → python → speech/ffmpeg/
+    /// claude), since terminating just the bash parent would leave the heavy
+    /// `speech` child running.
+    func stop() {
+        guard isRunning, let p = task else { return }
+        stopped = true
+        appendLine("\n⏹ stopping…")
+        Self.killTree(pid: p.processIdentifier)
+        p.terminate()
+    }
+
+    private static func killTree(pid: Int32) {
+        let pgrep = Process()
+        pgrep.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+        pgrep.arguments = ["-P", "\(pid)"]
+        let pipe = Pipe(); pgrep.standardOutput = pipe
+        try? pgrep.run(); pgrep.waitUntilExit()
+        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(),
+                         encoding: .utf8) ?? ""
+        for line in out.split(separator: "\n") {
+            if let child = Int32(line.trimmingCharacters(in: .whitespaces)) {
+                killTree(pid: child)
+            }
+        }
+        kill(pid, SIGTERM)
+    }
+
     private func finished(status: Int32) {
         task?.standardOutput.flatMap { ($0 as? Pipe) }?.fileHandleForReading.readabilityHandler = nil
         task = nil
         isRunning = false
-        if status == 0, let out = parseOutDir() {
+        if stopped {
+            appendLine("\n⏹ stopped.")
+        } else if status == 0, let out = parseOutDir() {
             lastOutDir = out
             appendLine("\n✓ done — opening \(out)")
             reveal(out)
@@ -315,6 +349,13 @@ struct ContentView: View {
                 ForEach(DiarizeEngine.allCases) { Text($0.rawValue).tag($0) }
             }
             .fixedSize()
+
+            Picker("ASR", selection: $m.asrModel) {
+                Text("0.6B").tag("0.6B")        // faster
+                Text("1.7B").tag("1.7B")        // accurate
+            }
+            .fixedSize()
+            .help("Speech recognition / alignment model — 0.6B is faster, 1.7B more accurate")
         }
         .disabled(m.isRunning)
     }
@@ -350,6 +391,11 @@ struct ContentView: View {
                 Text("Ready").foregroundColor(.secondary)
             }
             Spacer()
+            if m.isRunning {
+                Button("Stop") { m.stop() }
+                    .keyboardShortcut(".", modifiers: [.command])
+                    .tint(.red)
+            }
             Button(m.isRunning ? "Running…" : "Process") { m.run() }
                 .keyboardShortcut(.return, modifiers: [])
                 .disabled(m.audioURL == nil || m.isRunning)
