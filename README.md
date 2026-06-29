@@ -144,6 +144,22 @@ A frontier model is meaningfully better at the messy attribution step; a strong
 local model is fine for notes. Mixing — local for one, cloud for the other — is
 just two separate invocations on `--from-json`.
 
+### Frontier quality on your Claude subscription (no API key)
+
+`--llm-backend claude-cli` routes the two text steps through the local `claude`
+binary, so they run on your **Claude Pro/Max subscription** instead of the
+pay-per-token API — no `ANTHROPIC_API_KEY`, no per-call cost (subscription rate
+limits apply). In DropMemo this is the **Claude (sub)** backend.
+
+```bash
+python3 notetaker.py run meeting.m4a --llm-backend claude-cli --model-llm sonnet
+```
+
+> Note: the LLM backend only affects the two *text* steps (naming speakers +
+> notes). It has **no** effect on speed of diarization/alignment — those are
+> local `speech` audio passes. To speed *those* up, use a smaller ASR model
+> (`--model 0.6B`); to speed up the text steps, use a smaller local model.
+
 > **Don't** point this at Apple's on-device Foundation Model: its hard
 > 4096-token context can't hold a full meeting transcript without chunking.
 > Target Ollama with a 14B+ model instead.

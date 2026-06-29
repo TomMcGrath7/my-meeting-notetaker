@@ -39,10 +39,17 @@ enum Repo {
 
 enum Backend: String, CaseIterable, Identifiable {
     case ollama = "Ollama"
-    case anthropic = "Anthropic"
+    case claudeSub = "Claude (sub)"
+    case anthropic = "Anthropic (API)"
     var id: String { rawValue }
     /// process.sh's LLM_BACKEND value.
-    var llmBackend: String { self == .ollama ? "openai" : "anthropic" }
+    var llmBackend: String {
+        switch self {
+        case .ollama:    return "openai"
+        case .claudeSub: return "claude-cli"   // local `claude` → subscription
+        case .anthropic: return "anthropic"    // API key
+        }
+    }
 }
 
 enum DiarizeEngine: String, CaseIterable, Identifiable {
@@ -79,7 +86,8 @@ final class PipelineModel: ObservableObject {
     /// Default model name to show when the backend toggles.
     func backendChanged() {
         switch backend {
-        case .ollama:    if model.isEmpty || model.contains("claude") { model = "qwen3-coder:latest" }
+        case .ollama:    if model.isEmpty || model.contains("claude") || model.contains("sonnet") || model.contains("opus") { model = "qwen3-coder:latest" }
+        case .claudeSub: model = "sonnet"
         case .anthropic: if model.isEmpty || !model.contains("claude") { model = "claude-opus-4-8" }
         }
     }
@@ -154,8 +162,8 @@ final class PipelineModel: ObservableObject {
         switch backend {
         case .ollama:
             env["OLLAMA_MODEL"] = model              // process.sh passes this as --model-llm
-        case .anthropic:
-            args += ["--model-llm", model]           // anthropic model id is a pass-through flag
+        case .claudeSub, .anthropic:
+            args += ["--model-llm", model]           // model id/alias is a pass-through flag
         }
         if denoise { args.append("--denoise") }
         args += ["--diarize-engine", diarize.rawValue]

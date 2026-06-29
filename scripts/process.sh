@@ -15,7 +15,8 @@
 # Override defaults via env (handy from the app's controls strip / a Shortcut):
 #   OLLAMA_MODEL   local model name        (default: qwen3-coder:latest)
 #   OLLAMA_URL     OpenAI-compatible URL   (default: http://localhost:11434)
-#   LLM_BACKEND    openai | anthropic      (default: openai = Ollama)
+#   LLM_BACKEND    openai | claude-cli | anthropic  (default: openai = Ollama;
+#                  claude-cli routes via the `claude` binary / your subscription)
 #   OUT_ROOT       where out-dirs are made (default: the repo root)
 #
 # The LAST line printed is machine-readable for the caller:

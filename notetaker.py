@@ -341,7 +341,20 @@ def merge(words: list[Word], turns: list[Turn]) -> list[Segment]:
 
 def llm(messages: list[dict], system: str, *, backend: str, model: str,
         base_url: str, max_tokens: int) -> str:
-    """Minimal LLM call. backend='anthropic' or 'openai' (OpenAI-compatible)."""
+    """Minimal LLM call. backend='anthropic' (API key), 'openai'
+    (OpenAI-compatible, e.g. Ollama), or 'claude-cli' (the local `claude`
+    binary → your Claude Pro/Max subscription, no API key / no per-token cost)."""
+    if backend == "claude-cli":
+        if shutil.which("claude") is None:
+            sys.exit("error: --llm-backend claude-cli needs the `claude` CLI on PATH.")
+        user = "\n\n".join(m["content"] for m in messages if m.get("role") == "user")
+        cmd = ["claude", "-p", user, "--append-system-prompt", system,
+               "--output-format", "text"]
+        if model:
+            cmd += ["--model", model]   # e.g. "sonnet", "opus", or a full id
+        # Pure text transform — forbid tools so it can't touch the repo.
+        cmd += ["--disallowed-tools", "Bash", "Edit", "Write", "Read", "WebFetch"]
+        return sh(cmd).strip()
     if backend == "anthropic":
         key = os.environ.get("ANTHROPIC_API_KEY")
         if not key:
@@ -673,8 +686,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="skip the notes-generation LLM step")
     r.add_argument("--from-json",
                    help="reuse a previous pipeline.json (skip all audio stages)")
-    r.add_argument("--llm-backend", choices=["anthropic", "openai"],
-                   default="anthropic")
+    r.add_argument("--llm-backend", choices=["anthropic", "openai", "claude-cli"],
+                   default="anthropic",
+                   help="anthropic = API key; openai = OpenAI-compatible (Ollama); "
+                        "claude-cli = local `claude` binary via your subscription")
     r.add_argument("--model-llm", default="claude-sonnet-4-6",
                    help="LLM model id (anthropic) or local model name (openai)")
     r.add_argument("--base-url", default="https://api.anthropic.com",
