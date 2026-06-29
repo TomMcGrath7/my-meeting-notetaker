@@ -495,9 +495,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--diarize-engine", choices=["pyannote", "sortformer"],
-                        default="sortformer",
-                        help="sortformer = end-to-end on the Neural Engine (fast); "
-                             "pyannote = segmentation + embeddings (default tool)")
+                        default="pyannote",
+                        help="pyannote = segmentation + embeddings (default, robust); "
+                             "sortformer = end-to-end CoreML on the ANE (faster, but "
+                             "its CoreML model fails on some setups — verify with `check`)")
     common.add_argument("--vad-filter", action="store_true",
                         help="pre-filter silence with Silero VAD (pyannote only)")
     common.add_argument("--model", default="1.7B",

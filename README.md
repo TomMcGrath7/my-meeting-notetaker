@@ -130,9 +130,11 @@ just two separate invocations on `--from-json`.
 
 ## Tuning
 
-- **Diarizer:** `--diarize-engine sortformer` (default, end-to-end on the ANE)
-  vs `pyannote` (segmentation + speaker embeddings; add `--vad-filter`). If one
-  over-splits a speaker, try the other — the LLM merges duplicates anyway.
+- **Diarizer:** `--diarize-engine pyannote` (default, segmentation + speaker
+  embeddings; add `--vad-filter`) vs `sortformer` (end-to-end CoreML on the
+  ANE, faster — but its CoreML model fails on some macOS/Silicon setups and
+  silently returns zero speakers, so confirm with `check` before relying on
+  it). If one over-splits a speaker, try the other — the LLM merges duplicates.
 - **ASR size:** `--model 0.6B` is faster, `1.7B` (default) more accurate.
 - **Bad attribution?** The single biggest lever is the `context:` block — add
   roles and who-asks-vs-answers. The model is told to *flag* rather than guess
