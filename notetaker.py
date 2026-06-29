@@ -136,10 +136,15 @@ def denoise(wav: Path, out: Path) -> Path:
 # stage 2 — diarization  (speech diarize --json)
 # --------------------------------------------------------------------------- #
 
-def run_diarize(wav: Path, engine: str, vad_filter: bool) -> str:
+def run_diarize(wav: Path, engine: str, vad_filter: bool,
+                cluster_threshold: float | None = None) -> str:
     cmd = ["speech", "diarize", str(wav), "--engine", engine, "--json"]
     if vad_filter and engine == "pyannote":
         cmd.append("--vad-filter")
+    if cluster_threshold is not None:
+        # speech diarize over-splits one voice into several clusters; a lower
+        # threshold yields fewer speakers. Push it toward your known head count.
+        cmd += ["--cluster-threshold", str(cluster_threshold)]
     return sh(cmd)
 
 def _first(d: dict, *keys, default=None):
@@ -510,7 +515,7 @@ def cmd_check(args):
     if wav.suffix.lower() != ".wav":
         wav = to_wav16k(Path(args.file), Path("/tmp/_check.wav"))
     print("=== speech diarize --json (raw, first 1200 chars) ===")
-    raw_d = run_diarize(wav, args.diarize_engine, args.vad_filter)
+    raw_d = run_diarize(wav, args.diarize_engine, args.vad_filter, args.cluster_threshold)
     print(raw_d[:1200])
     turns = parse_diarize(raw_d)
     print(f"\n--> parsed {len(turns)} turns; first 5:")
@@ -555,7 +560,8 @@ def cmd_run(args):
             print("• denoising…")
             wav = denoise(wav, out_dir / "audio.clean.wav")
         print("• diarizing…")
-        turns = parse_diarize(run_diarize(wav, args.diarize_engine, args.vad_filter))
+        turns = parse_diarize(run_diarize(wav, args.diarize_engine, args.vad_filter,
+                                           args.cluster_threshold))
         print(f"  {len(turns)} turns, "
               f"{len({t.speaker for t in turns})} apparent speakers")
         transcript_text = None
@@ -634,6 +640,10 @@ def build_parser() -> argparse.ArgumentParser:
                              "its CoreML model fails on some setups — verify with `check`)")
     common.add_argument("--vad-filter", action="store_true",
                         help="pre-filter silence with Silero VAD (pyannote only)")
+    common.add_argument("--cluster-threshold", type=float, default=None,
+                        help="diarizer clustering threshold (speech default 0.715; "
+                             "LOWER = fewer speakers). Lower it if your known head "
+                             "count is over-split into too many SPEAKER_xx labels.")
     common.add_argument("--model", default="1.7B",
                         help="ASR/align model variant (0.6B | 1.7B)")
     common.add_argument("--language", default=None, help="language hint, e.g. en")
