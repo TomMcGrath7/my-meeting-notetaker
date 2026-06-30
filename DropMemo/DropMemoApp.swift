@@ -76,7 +76,8 @@ final class PipelineModel: ObservableObject {
     @Published var diarize: DiarizeEngine = .pyannote
     @Published var asrModel: String = "1.7B"          // 0.6B = faster, 1.7B = accurate
     @Published var language: String = "nl"            // hint for speech ASR (blank = auto)
-    @Published var transcriptURL: URL?                // optional: force-align this text instead
+    @Published var transcriptText: String = ""        // optional: paste a transcript to force-align
+    @Published var transcriptURL: URL?                // …or attach one from a file (fallback)
 
     // Meeting roster — written to config.yaml on each run (the pipeline reads it
     // to name speakers). Comma- or newline-separated names.
@@ -176,7 +177,16 @@ final class PipelineModel: ObservableObject {
         args += ["--model", asrModel]                // ASR/align size (0.6B|1.7B)
         let lang = language.trimmingCharacters(in: .whitespaces)
         if !lang.isEmpty { args += ["--language", lang] }
-        if let t = transcriptURL {                   // force-align this text (e.g. Voice Memos)
+        // Optional transcript to force-align (e.g. a Voice Memos export). Pasted
+        // text wins over an attached file; write it to a temp file for --transcript.
+        if !transcriptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let dir = FileManager.default.temporaryDirectory.appendingPathComponent("DropMemo", isDirectory: true)
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let f = dir.appendingPathComponent("pasted-transcript.txt")
+            if (try? transcriptText.write(to: f, atomically: true, encoding: .utf8)) != nil {
+                args += ["--transcript", f.path]
+            }
+        } else if let t = transcriptURL {
             args += ["--transcript", t.path]
         }
 
@@ -287,7 +297,7 @@ struct ContentView: View {
             statusBar
         }
         .padding(16)
-        .frame(minWidth: 580, minHeight: 680)
+        .frame(minWidth: 580, minHeight: 740)
     }
 
     private var dropZone: some View {
@@ -375,17 +385,28 @@ struct ContentView: View {
     }
 
     private var transcriptRow: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "doc.text").foregroundColor(.secondary)
-            Text(m.transcriptURL?.lastPathComponent
-                 ?? "No transcript — speech will transcribe (attach a Voice Memos export for better text)")
-                .font(.caption).foregroundColor(.secondary)
-                .lineLimit(1).truncationMode(.middle)
-            Spacer()
-            Button("Attach transcript…") { pickTranscript() }
-            if m.transcriptURL != nil {
-                Button("Clear") { m.transcriptURL = nil }
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text("Transcript (optional — paste a Voice Memos export to force-align)")
+                    .font(.caption).foregroundColor(.secondary)
+                Spacer()
+                Button("Attach file…") { pickTranscript() }
+                if !m.transcriptText.isEmpty || m.transcriptURL != nil {
+                    Button("Clear") { m.transcriptText = ""; m.transcriptURL = nil }
+                }
             }
+            TextEditor(text: $m.transcriptText)
+                .font(.system(.caption, design: .default))
+                .frame(height: 48)
+                .overlay(RoundedRectangle(cornerRadius: 5).stroke(.secondary.opacity(0.3)))
+                .overlay(alignment: .topLeading) {
+                    if m.transcriptText.isEmpty {
+                        Text(m.transcriptURL.map { "Using file: \($0.lastPathComponent)" }
+                             ?? "Paste here for better text (especially non-English); leave empty to let speech transcribe.")
+                            .font(.caption).foregroundColor(.secondary)
+                            .padding(.horizontal, 5).padding(.vertical, 4).allowsHitTesting(false)
+                    }
+                }
         }
         .disabled(m.isRunning)
     }
