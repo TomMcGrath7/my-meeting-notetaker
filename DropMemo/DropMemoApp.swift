@@ -75,6 +75,8 @@ final class PipelineModel: ObservableObject {
     @Published var denoise = false
     @Published var diarize: DiarizeEngine = .pyannote
     @Published var asrModel: String = "1.7B"          // 0.6B = faster, 1.7B = accurate
+    @Published var language: String = "nl"            // hint for speech ASR (blank = auto)
+    @Published var transcriptURL: URL?                // optional: force-align this text instead
 
     // Meeting roster — written to config.yaml on each run (the pipeline reads it
     // to name speakers). Comma- or newline-separated names.
@@ -172,6 +174,11 @@ final class PipelineModel: ObservableObject {
         if denoise { args.append("--denoise") }
         args += ["--diarize-engine", diarize.rawValue]
         args += ["--model", asrModel]                // ASR/align size (0.6B|1.7B)
+        let lang = language.trimmingCharacters(in: .whitespaces)
+        if !lang.isEmpty { args += ["--language", lang] }
+        if let t = transcriptURL {                   // force-align this text (e.g. Voice Memos)
+            args += ["--transcript", t.path]
+        }
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/bash")
@@ -275,11 +282,12 @@ struct ContentView: View {
             dropZone
             roster
             controls
+            transcriptRow
             logView
             statusBar
         }
         .padding(16)
-        .frame(minWidth: 580, minHeight: 640)
+        .frame(minWidth: 580, minHeight: 680)
     }
 
     private var dropZone: some View {
@@ -356,6 +364,28 @@ struct ContentView: View {
             }
             .fixedSize()
             .help("Speech recognition / alignment model — 0.6B is faster, 1.7B more accurate")
+
+            HStack(spacing: 4) {
+                Text("Lang").foregroundColor(.secondary)
+                TextField("auto", text: $m.language).frame(width: 42).textFieldStyle(.roundedBorder)
+            }
+            .help("Language hint for speech ASR, e.g. nl or en. Blank = auto-detect.")
+        }
+        .disabled(m.isRunning)
+    }
+
+    private var transcriptRow: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "doc.text").foregroundColor(.secondary)
+            Text(m.transcriptURL?.lastPathComponent
+                 ?? "No transcript — speech will transcribe (attach a Voice Memos export for better text)")
+                .font(.caption).foregroundColor(.secondary)
+                .lineLimit(1).truncationMode(.middle)
+            Spacer()
+            Button("Attach transcript…") { pickTranscript() }
+            if m.transcriptURL != nil {
+                Button("Clear") { m.transcriptURL = nil }
+            }
         }
         .disabled(m.isRunning)
     }
@@ -448,6 +478,14 @@ struct ContentView: View {
         if panel.runModal() == .OK, let url = panel.url {
             m.accept(url)
         }
+    }
+
+    private func pickTranscript() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.allowedContentTypes = [.plainText, .text]
+        if panel.runModal() == .OK, let url = panel.url { m.transcriptURL = url }
     }
 }
 

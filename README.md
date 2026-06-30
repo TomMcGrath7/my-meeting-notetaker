@@ -207,8 +207,11 @@ Override via env: `OLLAMA_MODEL`, `OLLAMA_URL`, `LLM_BACKEND`, `OUT_ROOT`.
 **DropMemo** (macOS app) — one window: drag a memo onto it (or use the file
 picker), set **who's in the meeting** (the participants + context fields write
 straight to `config.yaml`, and are pre-filled from it on launch), pick the
-backend/model/denoise/diarize-engine, watch the pipeline stream live, and on
-completion it reveals the out-dir and opens `notes.md`. Build it without Xcode:
+backend / LLM model / denoise / diarize-engine / **ASR size** / **language**,
+optionally **attach a transcript** (a Voice Memos export → force-aligned for
+much better text, especially non-English), watch the pipeline stream live, and
+**Stop** (⌘.) any time. On completion it reveals the out-dir and opens
+`notes.md`. Build it without Xcode:
 
 ```bash
 scripts/build_dropmemo.sh          # → build/DropMemo.app (swiftc, ad-hoc signed)
