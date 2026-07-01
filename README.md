@@ -107,10 +107,22 @@ app and a Shortcut both wrap this so you only ever drag in a file.
 
 `speech align` — whether it transcribes or force-aligns — only handles a few
 minutes of audio per call; on a long recording it silently squashes every word
-timestamp into the first ~2 minutes. notetaker works around this automatically:
-it slices the audio into `--align-chunk` windows (default 300s), aligns each,
-and stitches the timestamps back together. You don't have to do anything; just
-know an hour-long file means ~12 alignment passes.
+timestamp into the first ~2 minutes, which then scrambles speaker attribution.
+notetaker works around this automatically: it slices the audio into
+`--align-chunk` windows, aligns each, and stitches the timestamps back together.
+You don't have to do anything; just know an hour-long file means several passes.
+
+The safe window differs by mode, so the default is adaptive:
+
+- **transcribing** (no transcript): **300s** — the ASR times its own words and
+  stays coherent across a 5-minute chunk.
+- **force-aligning** (`--transcript`): **120s** — the forced aligner overloads on
+  longer chunks (feeding it ~700 words / 300s makes it dump the whole chunk into
+  the first ~140s), so it needs a tighter window.
+
+Pass `--align-chunk N` to override. If a chunk still collapses, notetaker prints
+a `⚠️ … collapsed` warning to stderr; add `--strict` to make that a hard failure
+(non-zero exit) instead of continuing with unreliable timestamps.
 
 If you already have a transcript (e.g. exported from Voice Memos), hand it over
 and notetaker **force-aligns** it instead of transcribing — better text, and it
@@ -127,6 +139,20 @@ python3 notetaker.py run meeting.m4a --transcript voice-memo.txt
 | `transcript_named.md` | speaker-attributed transcript; `⚠️ uncertain` marks flagged turns |
 | `notes.md` | summary, key decisions, action items, open questions |
 | `pipeline.json` | every intermediate — re-run the LLM steps without re-processing audio |
+
+## Tests
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+Stdlib `unittest` only (no extra deps), no audio/model/network — runs in
+milliseconds. Covers the pure functions that actually break things: the
+`diarize`/`align` output parsers (pinned against captured real `speech` output
+in `tests/fixtures/`, so a format drift fails loudly instead of silently
+corrupting output), word→speaker attribution (`merge`), and the alignment
+chunking + collapse guard. If you upgrade speech-swift and `notetaker.py check`
+shows a new output format, re-capture the fixtures.
 
 ## Going fully offline
 

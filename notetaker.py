@@ -241,9 +241,15 @@ def run_align(wav: Path, model: str, language: str | None,
         cmd += ["--text", transcript]
     return sh(cmd)
 
+class AlignmentCollapse(RuntimeError):
+    """Raised (only under strict mode) when one or more align chunks collapse —
+    i.e. the aligner piled a chunk's words into the front of its window, so the
+    timestamps there can't be trusted for speaker attribution."""
+
 def align_words(wav: Path, model: str, language: str | None,
                 transcript: str | None = None,
                 chunk_seconds: float = ALIGN_CHUNK_SECONDS,
+                strict: bool = False,
                 progress=None) -> list[Word]:
     """Word-level timestamps for the whole file, chunking long audio (see note
     on ALIGN_CHUNK_SECONDS). With a `transcript` (e.g. exported from Voice
@@ -284,6 +290,9 @@ def align_words(wav: Path, model: str, language: str | None,
     if squashed:
         print(f"  ⚠️  {squashed}/{n} chunks collapsed — try a smaller "
               f"--align-chunk (current {chunk_seconds:.0f}s)", file=sys.stderr)
+        if strict:
+            raise AlignmentCollapse(
+                f"{squashed}/{n} align chunks collapsed at {chunk_seconds:.0f}s")
     try:
         tmp.unlink()
     except OSError:
@@ -614,10 +623,15 @@ def cmd_run(args):
                   f"{align_chunk:.0f}s, {mode})")
         else:
             print("• aligning words…")
-        words = align_words(wav, args.model, args.language,
-                            transcript=transcript_text,
-                            chunk_seconds=align_chunk,
-                            progress=lambda i, n, t: print(f"  chunk {i}/{n} … {t} words"))
+        try:
+            words = align_words(wav, args.model, args.language,
+                                transcript=transcript_text,
+                                chunk_seconds=align_chunk,
+                                strict=args.strict,
+                                progress=lambda i, n, t: print(f"  chunk {i}/{n} … {t} words"))
+        except AlignmentCollapse as e:
+            sys.exit(f"error: {e}. Re-run with a smaller --align-chunk, or drop "
+                     f"--strict to accept the unreliable timestamps.")
         print(f"  {len(words)} words")
         if not turns or not words:
             sys.exit("error: diarization or alignment produced nothing. "
@@ -712,6 +726,9 @@ def build_parser() -> argparse.ArgumentParser:
                         f"the forced aligner overloads on longer chunks). speech "
                         f"align only handles a few minutes per call, so long files "
                         f"are chunked + stitched.")
+    r.add_argument("--strict", action="store_true",
+                   help="fail the run (non-zero exit) if any alignment chunk "
+                        "collapses, instead of emitting a warning and continuing")
     r.add_argument("--no-notes", action="store_true",
                    help="skip the notes-generation LLM step")
     r.add_argument("--from-json",

@@ -1,0 +1,83 @@
+Loading audio: <AUDIO>.wav
+  Loaded 1600000 samples (100.00s)
+Loading diarization models (embedding engine: mlx)...
+  [0%] Downloading segmentation model...
+  [30%] Downloading segmentation weights...
+  [30%] Downloading speaker embedding model...
+  [30%] Downloading speaker embedding model...
+  [62%] Downloading weights...
+  [62%] Loading model...
+  [70%] Ready
+  [100%] Ready
+Running diarization...
+{
+  "segments" : [
+    {
+      "start" : 0,
+      "end" : 10.331,
+      "speaker" : 0,
+      "duration" : 10.331
+    },
+    {
+      "end" : 23.209,
+      "start" : 10.670999999999999,
+      "duration" : 12.538,
+      "speaker" : 0
+    },
+    {
+      "speaker" : 0,
+      "start" : 24.244,
+      "end" : 25.024999999999999,
+      "duration" : 0.78100000000000003
+    },
+    {
+      "duration" : 4.6429999999999998,
+      "end" : 30.603000000000002,
+      "start" : 25.959,
+      "speaker" : 0
+    },
+    {
+      "start" : 31.469000000000001,
+      "end" : 33.447000000000003,
+      "speaker" : 0,
+      "duration" : 1.978
+    },
+    {
+      "end" : 39.991999999999997,
+      "start" : 34.771000000000001,
+      "duration" : 5.2210000000000001,
+      "speaker" : 1
+    },
+    {
+      "speaker" : 1,
+      "end" : 51.756999999999998,
+      "start" : 41.960999999999999,
+      "duration" : 9.7959999999999994
+    },
+    {
+      "end" : 55.246000000000002,
+      "speaker" : 1,
+      "duration" : 3.1829999999999998,
+      "start" : 52.063000000000002
+    },
+    {
+      "start" : 55.738999999999997,
+      "end" : 57.5,
+      "duration" : 1.7609999999999999,
+      "speaker" : 1
+    },
+    {
+      "start" : 57.5,
+      "end" : 69.787999999999997,
+      "duration" : 12.288,
+      "speaker" : 0
+    },
+    {
+      "end" : 100,
+      "duration" : 28.888000000000002,
+      "speaker" : 0,
+      "start" : 71.111999999999995
+    }
+  ],
+  "num_speakers" : 2
+}
