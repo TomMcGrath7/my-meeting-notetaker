@@ -210,7 +210,15 @@ _ALIGN_RE = re.compile(r"\[\s*([\d.]+)\s*s?\s*-\s*([\d.]+)\s*s?\s*\]\s*(.+?)\s*$
 # word timestamp into the first ~2 minutes (verified on a 58-min file: 9k words
 # all squashed into 136-232s). So we slice the audio into windows this long,
 # align each, and shift the timestamps back onto the real timeline.
+#
+# The safe window differs by mode. Transcribing (ASR path) times its own words
+# and stays coherent across a 300s chunk. Force-aligning provided text is far
+# tighter: the 0.6B forced aligner overloads well before 300s — feeding it ~700
+# words / 300s makes it give up and pile the whole chunk into the first ~140s
+# (measured), which then scrambles every speaker cut downstream. ~120s keeps it
+# inside the aligner's capacity (~230 words), so we default lower in that mode.
 ALIGN_CHUNK_SECONDS = 300.0
+ALIGN_CHUNK_SECONDS_FORCED = 120.0
 
 def _wav_duration(wav: Path) -> float:
     with wave.open(str(wav), "rb") as w:
@@ -249,6 +257,7 @@ def align_words(wav: Path, model: str, language: str | None,
     n = int(dur // chunk_seconds) + (1 if dur % chunk_seconds else 0)
     text_words = transcript.split() if transcript else None
     words: list[Word] = []
+    squashed = 0
     tmp = wav.parent / "_align_chunk.wav"
     for i in range(n):
         start = i * chunk_seconds
@@ -259,10 +268,22 @@ def align_words(wav: Path, model: str, language: str | None,
             a = (i * len(text_words)) // n
             b = ((i + 1) * len(text_words)) // n
             slice_text = " ".join(text_words[a:b]) or None
-        for w in parse_align(run_align(tmp, model, language, slice_text)):
+        local = parse_align(run_align(tmp, model, language, slice_text))
+        # Collapse guard: a healthy chunk spreads its words across the window.
+        # When the aligner overloads it dumps everything into the front, leaving
+        # the tail empty — that scrambles speaker attribution, so flag it loudly.
+        if local and length > 30 and max(w.end for w in local) < 0.6 * length:
+            squashed += 1
+            print(f"  ⚠️  chunk {i + 1}/{n}: {len(local)} words collapsed into "
+                  f"{max(w.end for w in local):.0f}s of a {length:.0f}s window "
+                  f"— timestamps unreliable here", file=sys.stderr)
+        for w in local:
             words.append(Word(text=w.text, start=w.start + start, end=w.end + start))
         if progress:
             progress(i + 1, n, len(words))
+    if squashed:
+        print(f"  ⚠️  {squashed}/{n} chunks collapsed — try a smaller "
+              f"--align-chunk (current {chunk_seconds:.0f}s)", file=sys.stderr)
     try:
         tmp.unlink()
     except OSError:
@@ -580,16 +601,22 @@ def cmd_run(args):
         transcript_text = None
         if getattr(args, "transcript", None):
             transcript_text = Path(args.transcript).read_text().strip() or None
+        # Force-aligning provided text overloads the aligner sooner than
+        # transcribing does, so it needs a smaller default window (see
+        # ALIGN_CHUNK_SECONDS_FORCED). An explicit --align-chunk always wins.
+        align_chunk = args.align_chunk or (
+            ALIGN_CHUNK_SECONDS_FORCED if transcript_text else ALIGN_CHUNK_SECONDS)
         dur = _wav_duration(wav)
-        if dur > args.align_chunk + 1.0:
-            n = int(dur // args.align_chunk) + (1 if dur % args.align_chunk else 0)
+        if dur > align_chunk + 1.0:
+            n = int(dur // align_chunk) + (1 if dur % align_chunk else 0)
             mode = "forced-align" if transcript_text else "transcribe"
-            print(f"• aligning words… ({dur/60:.0f} min → {n} chunks, {mode})")
+            print(f"• aligning words… ({dur/60:.0f} min → {n} chunks, "
+                  f"{align_chunk:.0f}s, {mode})")
         else:
             print("• aligning words…")
         words = align_words(wav, args.model, args.language,
                             transcript=transcript_text,
-                            chunk_seconds=args.align_chunk,
+                            chunk_seconds=align_chunk,
                             progress=lambda i, n, t: print(f"  chunk {i}/{n} … {t} words"))
         print(f"  {len(words)} words")
         if not turns or not words:
@@ -678,10 +705,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "Voice Memos); force-align THIS text to the audio instead "
                         "of transcribing. Better text, but best-effort across "
                         "chunks since the source text is untimed.")
-    r.add_argument("--align-chunk", type=float, default=ALIGN_CHUNK_SECONDS,
+    r.add_argument("--align-chunk", type=float, default=None,
                    help=f"seconds of audio per alignment chunk (default "
-                        f"{int(ALIGN_CHUNK_SECONDS)}). speech align only handles a "
-                        f"few minutes per call, so long files are chunked + stitched.")
+                        f"{int(ALIGN_CHUNK_SECONDS)} transcribing, "
+                        f"{int(ALIGN_CHUNK_SECONDS_FORCED)} with --transcript, since "
+                        f"the forced aligner overloads on longer chunks). speech "
+                        f"align only handles a few minutes per call, so long files "
+                        f"are chunked + stitched.")
     r.add_argument("--no-notes", action="store_true",
                    help="skip the notes-generation LLM step")
     r.add_argument("--from-json",
