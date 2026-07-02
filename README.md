@@ -124,6 +124,11 @@ Pass `--align-chunk N` to override. If a chunk still collapses, notetaker prints
 a `⚠️ … collapsed` warning to stderr; add `--strict` to make that a hard failure
 (non-zero exit) instead of continuing with unreliable timestamps.
 
+> Debugging bad speaker cuts or timestamps? Read
+> [`docs/transcript-cut-quality.md`](docs/transcript-cut-quality.md) first — it
+> records the root cause and, importantly, the plausible-but-wrong fixes we
+> already ruled out, so they don't get retried.
+
 If you already have a transcript (e.g. exported from Voice Memos), hand it over
 and notetaker **force-aligns** it instead of transcribing — better text, and it
 skips ASR entirely:

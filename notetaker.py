@@ -33,7 +33,7 @@ import sys
 import wave
 import urllib.request
 import urllib.error
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict, field, replace
 from pathlib import Path
 
 # --------------------------------------------------------------------------- #
@@ -365,6 +365,51 @@ def merge(words: list[Word], turns: list[Turn]) -> list[Segment]:
         s.text = re.sub(r"\s+([,.;:!?])", r"\1", s.text).strip()
     return segments
 
+# A word-timestamp landing in the wrong diarization turn splits one person's
+# speech into several blocks, or wedges a stray word under the wrong name. Two
+# cheap, deterministic passes clean that up AFTER relabeling (when raw clusters
+# have collapsed to real names) — no LLM, no re-processing.
+_SENTENCE_END = re.compile(r"[.!?][\"”')\]]*\s*$")
+_MIN_FLIP_WORDS = 2   # a fragment this short, mid-sentence, wedged between two
+                      # blocks of the SAME other speaker is diarizer thrash.
+
+def _coalesce(segs: list[Segment]) -> list[Segment]:
+    """Merge consecutive same-speaker segments into one (copies, never mutates
+    the input). Flags and reasons are unioned; span/text are joined."""
+    out: list[Segment] = []
+    for s in segs:
+        if out and out[-1].speaker == s.speaker:
+            prev = out[-1]
+            prev.text = f"{prev.text} {s.text}".strip()
+            prev.end = s.end
+            if s.flagged and not prev.flagged:
+                prev.flagged, prev.flag_reason = True, s.flag_reason
+        else:
+            out.append(replace(s))
+    return out
+
+def _absorb_noise_flips(segs: list[Segment]) -> list[Segment]:
+    """Reassign a very short, non-sentence fragment to its neighbours when both
+    sides are the same OTHER speaker (a one-word speaker flip mid-sentence is
+    almost always a timing artifact, not a real turn)."""
+    out: list[Segment] = []
+    for i, s in enumerate(segs):
+        prev = out[-1] if out else None
+        nxt = segs[i + 1] if i + 1 < len(segs) else None
+        if (prev and nxt and prev.speaker == nxt.speaker != s.speaker
+                and len(s.text.split()) <= _MIN_FLIP_WORDS
+                and not _SENTENCE_END.search(s.text)):
+            s = replace(s, speaker=prev.speaker)
+        out.append(replace(s))
+    return out
+
+def tidy_segments(segs: list[Segment]) -> list[Segment]:
+    """Coalesce same-speaker runs, absorb tiny noise flips, coalesce again.
+    Idempotent. Deliberately does NOT snap long turns to sentence boundaries —
+    real fast turn-taking often lacks punctuation at the handoff, so that would
+    move whole blocks to the wrong speaker."""
+    return _coalesce(_absorb_noise_flips(_coalesce(segs)))
+
 # --------------------------------------------------------------------------- #
 # stage 5/6 — LLM: relabel + correct, then notes  (text only)
 # --------------------------------------------------------------------------- #
@@ -662,6 +707,12 @@ def cmd_run(args):
               + (f"; {n_filled} over-split segment(s) merged to nearest" if n_filled else ""))
     else:
         print("• no participants in config — skipping LLM attribution.")
+
+    before = len(pipe.segments)
+    pipe.segments = tidy_segments(pipe.segments)
+    if len(pipe.segments) < before:
+        print(f"• tidied segments: {before} → {len(pipe.segments)} "
+              f"(merged same-speaker splits / absorbed stray words)")
 
     (out_dir / "transcript_named.md").write_text(render_named(pipe.segments))
     (out_dir / "pipeline.json").write_text(pipe.to_json())

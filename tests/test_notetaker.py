@@ -265,5 +265,77 @@ class TestAlignWords(unittest.TestCase):
             N.align_words(Path("x.wav"), "1.7B", "en", chunk_seconds=100, strict=True)
 
 
+# --------------------------------------------------------------------------- #
+# tidy_segments : coalesce same-speaker runs + absorb tiny noise flips
+# --------------------------------------------------------------------------- #
+
+class TestTidySegments(unittest.TestCase):
+    def seg(self, spk, start, end, text, flagged=False, reason=""):
+        return N.Segment(speaker=spk, start=start, end=end, text=text,
+                         flagged=flagged, flag_reason=reason)
+
+    def test_coalesce_merges_adjacent_same_speaker(self):
+        # over-split into 3 blocks that all relabeled to the same name.
+        segs = [self.seg("Tom", 0, 1, "additional stuff. I"),
+                self.seg("Tom", 1, 2, "mean,"),
+                self.seg("Tom", 2, 3, "you could also")]
+        out = N._coalesce(segs)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0].text, "additional stuff. I mean, you could also")
+        self.assertEqual((out[0].start, out[0].end), (0, 3))
+
+    def test_coalesce_does_not_mutate_input(self):
+        segs = [self.seg("Tom", 0, 1, "a"), self.seg("Tom", 1, 2, "b")]
+        N._coalesce(segs)
+        self.assertEqual(segs[0].text, "a")   # original untouched
+
+    def test_coalesce_unions_flags(self):
+        segs = [self.seg("Tom", 0, 1, "a"),
+                self.seg("Tom", 1, 2, "b", flagged=True, reason="why")]
+        out = N._coalesce(segs)
+        self.assertTrue(out[0].flagged)
+        self.assertEqual(out[0].flag_reason, "why")
+
+    def test_absorb_tiny_flip_between_same_speaker(self):
+        # Tobias … [one stray Tom word] … Tobias  → the word is timing noise.
+        segs = [self.seg("Tobias", 0, 5, "a long turn here"),
+                self.seg("Tom", 5, 6, "all"),
+                self.seg("Tobias", 6, 10, "continues talking")]
+        out = N.tidy_segments(segs)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0].speaker, "Tobias")
+        self.assertIn("all", out[0].text)
+
+    def test_does_not_absorb_complete_sentence(self):
+        # A short but COMPLETE utterance is a real turn — keep it.
+        segs = [self.seg("Tobias", 0, 5, "a long turn here"),
+                self.seg("Tom", 5, 6, "This is English?"),
+                self.seg("Tobias", 6, 10, "continues talking")]
+        out = N.tidy_segments(segs)
+        self.assertEqual([s.speaker for s in out], ["Tobias", "Tom", "Tobias"])
+
+    def test_does_not_absorb_when_neighbours_differ(self):
+        segs = [self.seg("Tobias", 0, 5, "turn one"),
+                self.seg("Tom", 5, 6, "hi"),
+                self.seg("Dani", 6, 10, "turn three")]
+        out = N.tidy_segments(segs)
+        self.assertEqual([s.speaker for s in out], ["Tobias", "Tom", "Dani"])
+
+    def test_does_not_absorb_long_fragment(self):
+        segs = [self.seg("Tobias", 0, 5, "turn one"),
+                self.seg("Tom", 5, 6, "this is more than two words"),
+                self.seg("Tobias", 6, 10, "turn three")]
+        out = N.tidy_segments(segs)
+        self.assertEqual([s.speaker for s in out], ["Tobias", "Tom", "Tobias"])
+
+    def test_idempotent(self):
+        segs = [self.seg("Tom", 0, 1, "a"), self.seg("Tom", 1, 2, "b"),
+                self.seg("Tobias", 2, 3, "c")]
+        once = N.tidy_segments(segs)
+        twice = N.tidy_segments(once)
+        self.assertEqual([(s.speaker, s.text) for s in once],
+                         [(s.speaker, s.text) for s in twice])
+
+
 if __name__ == "__main__":
     unittest.main()
