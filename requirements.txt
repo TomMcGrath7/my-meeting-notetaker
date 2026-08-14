@@ -1,3 +1,9 @@
-# Only third-party dep; everything else is Python stdlib.
+# Third-party deps; everything else is Python stdlib.
 # (ffmpeg and the `speech` binary are installed via Homebrew, not pip.)
 PyYAML>=6.0
+# Path dependency, editable: llm-seam's surface is still moving, and every
+# consumer sits beside it under ~/Documents/GitHub with one developer, so a
+# fix there is picked up here with no reinstall. Pin to a git+tag source
+# instead if this ever needs to install somewhere llm-seam isn't checked out
+# next to it (e.g. a VPS or container).
+-e ../llm-seam

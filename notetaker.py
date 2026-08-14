@@ -36,6 +36,8 @@ import urllib.error
 from dataclasses import dataclass, asdict, field, replace
 from pathlib import Path
 
+from llm_seam import ClaudeCli, LlmSeamError
+
 # --------------------------------------------------------------------------- #
 # small helpers
 # --------------------------------------------------------------------------- #
@@ -418,18 +420,24 @@ def llm(messages: list[dict], system: str, *, backend: str, model: str,
         base_url: str, max_tokens: int) -> str:
     """Minimal LLM call. backend='anthropic' (API key), 'openai'
     (OpenAI-compatible, e.g. Ollama), or 'claude-cli' (the local `claude`
-    binary → your Claude Pro/Max subscription, no API key / no per-token cost)."""
+    binary → your Claude Pro/Max subscription, no API key / no per-token cost,
+    via llm-seam)."""
     if backend == "claude-cli":
-        if shutil.which("claude") is None:
-            sys.exit("error: --llm-backend claude-cli needs the `claude` CLI on PATH.")
         user = "\n\n".join(m["content"] for m in messages if m.get("role") == "user")
-        cmd = ["claude", "-p", user, "--append-system-prompt", system,
-               "--output-format", "text"]
-        if model:
-            cmd += ["--model", model]   # e.g. "sonnet", "opus", or a full id
-        # Pure text transform — forbid tools so it can't touch the repo.
-        cmd += ["--disallowed-tools", "Bash", "Edit", "Write", "Read", "WebFetch"]
-        return sh(cmd).strip()
+        cli = ClaudeCli(
+            model=model or None,   # e.g. "sonnet", "opus", or a full id
+            system=system,
+            # Keep Claude Code's own system prompt + tool-use behaviour (what
+            # --append-system-prompt did here before) rather than replacing it.
+            system_mode="append",
+            output_format="text",
+            # Pure text transform — forbid tools so it can't touch the repo.
+            disallowed_tools=["Bash", "Edit", "Write", "Read", "WebFetch"],
+        )
+        try:
+            return cli.run(user).text.strip()
+        except LlmSeamError as e:
+            sys.exit(f"error: claude-cli backend failed: {e}")
     if backend == "anthropic":
         key = os.environ.get("ANTHROPIC_API_KEY")
         if not key:
