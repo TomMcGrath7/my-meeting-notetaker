@@ -15,6 +15,8 @@ import SwiftUI
 import AppKit
 import Darwin
 import UniformTypeIdentifiers
+import AVFoundation
+import Speech
 
 // MARK: - Where the repo (and thus process.sh + config.yaml) lives
 
@@ -56,6 +58,127 @@ enum Backend: String, CaseIterable, Identifiable {
 enum DiarizeEngine: String, CaseIterable, Identifiable {
     case pyannote, sortformer
     var id: String { rawValue }
+}
+
+// MARK: - Dictation: speak the meeting context instead of typing it
+
+/// On-device speech → text for the context field. Deliberately **on-device
+/// only**: `requiresOnDeviceRecognition` is forced on, and if the locale has no
+/// local model we refuse and say so rather than quietly streaming meeting
+/// context to Apple's servers. This app exists so recordings never leave the
+/// Mac; the box you describe them in should hold to the same rule.
+@MainActor
+final class Dictation: ObservableObject {
+    @Published private(set) var isListening = false
+    /// Last thing worth telling the user (denied permission, no local model…).
+    @Published var note: String?
+
+    private let engine = AVAudioEngine()
+    private var request: SFSpeechAudioBufferRecognitionRequest?
+    private var task: SFSpeechRecognitionTask?
+    /// What the field held when we started. Partial results are appended to
+    /// this, so a re-transcription replaces the guess instead of doubling it.
+    private var base = ""
+    private var emit: ((String) -> Void)?
+
+    /// The locale to dictate in. Deliberately the **system** locale, not the
+    /// app's Lang field: Lang describes the recording, while this box is Tom's
+    /// own note about it, and the two are routinely different languages.
+    static var locale: Locale { Locale.current }
+
+    func toggle(current: String, emit: @escaping (String) -> Void) {
+        if isListening { stop() } else { start(current: current, emit: emit) }
+    }
+
+    private func start(current: String, emit: @escaping (String) -> Void) {
+        note = nil
+        self.base = current
+        self.emit = emit
+        // Both prompts are TCC-backed; NSMicrophoneUsageDescription and
+        // NSSpeechRecognitionUsageDescription must be in Info.plist or the
+        // request traps instead of asking.
+        SFSpeechRecognizer.requestAuthorization { auth in
+            Task { @MainActor in
+                guard auth == .authorized else {
+                    self.note = "Speech recognition not allowed (System Settings ▸ Privacy & Security ▸ Speech Recognition)."
+                    return
+                }
+                let granted = await AVCaptureDevice.requestAccess(for: .audio)
+                guard granted else {
+                    self.note = "Microphone not allowed (System Settings ▸ Privacy & Security ▸ Microphone)."
+                    return
+                }
+                self.listen()
+            }
+        }
+    }
+
+    private func listen() {
+        let loc = Self.locale
+        let name = loc.identifier
+        guard let rec = SFSpeechRecognizer(locale: loc) else {
+            note = "No speech recogniser for \(name)."
+            return
+        }
+        guard rec.isAvailable else { note = "Speech recogniser for \(name) is unavailable."; return }
+        // Not every language ships an offline model (nl-NL does not, out of the
+        // box). Say so and stop, rather than falling back to Apple's servers.
+        guard rec.supportsOnDeviceRecognition else {
+            note = "No on-device model for \(name). Add it under System Settings ▸ Keyboard ▸ Dictation ▸ Edit Languages, then reopen DropMemo. Not sending audio to Apple."
+            return
+        }
+
+        let req = SFSpeechAudioBufferRecognitionRequest()
+        req.shouldReportPartialResults = true
+        req.requiresOnDeviceRecognition = true       // never off this machine
+        request = req
+
+        let input = engine.inputNode
+        // Tap with the node's OWN format — a hand-rolled one crashes CoreAudio.
+        input.installTap(onBus: 0, bufferSize: 1024, format: input.outputFormat(forBus: 0)) { buf, _ in
+            req.append(buf)
+        }
+        engine.prepare()
+        do { try engine.start() } catch {
+            note = "Couldn't start the microphone: \(error.localizedDescription)"
+            teardown()
+            return
+        }
+
+        isListening = true
+        task = rec.recognitionTask(with: req) { [weak self] result, error in
+            Task { @MainActor in
+                guard let self else { return }
+                if let result {
+                    self.push(result.bestTranscription.formattedString)
+                    if result.isFinal { self.stop() }
+                }
+                if error != nil { self.stop() }
+            }
+        }
+    }
+
+    /// base + heard, with one space between if the field didn't end in whitespace.
+    private func push(_ heard: String) {
+        guard !heard.isEmpty else { return }
+        let joiner = (base.isEmpty || base.last?.isWhitespace == true) ? "" : " "
+        emit?(base + joiner + heard)
+    }
+
+    func stop() {
+        guard isListening || engine.isRunning else { return }
+        isListening = false
+        request?.endAudio()
+        task?.finish()
+        teardown()
+    }
+
+    private func teardown() {
+        if engine.isRunning { engine.stop() }
+        engine.inputNode.removeTap(onBus: 0)
+        request = nil
+        task = nil
+    }
 }
 
 // MARK: - Model: owns the log + drives the Process
@@ -286,6 +409,7 @@ final class PipelineModel: ObservableObject {
 struct ContentView: View {
     @ObservedObject var m = PipelineModel.shared
     @State private var dropHighlight = false
+    @StateObject private var dictation = Dictation()
 
     var body: some View {
         VStack(spacing: 12) {
@@ -337,16 +461,39 @@ struct ContentView: View {
             TextEditor(text: $m.context)
                 .font(.system(.caption, design: .default))
                 .frame(height: 56)
-                .overlay(RoundedRectangle(cornerRadius: 5).stroke(.secondary.opacity(0.3)))
+                .overlay(RoundedRectangle(cornerRadius: 5)
+                    .stroke(dictation.isListening ? Color.red.opacity(0.7) : Color.secondary.opacity(0.3)))
                 .overlay(alignment: .topLeading) {
-                    if m.context.isEmpty {
+                    if m.context.isEmpty && !dictation.isListening {
                         Text("Optional context: roles, who dials in, recurring topics…")
                             .font(.caption).foregroundColor(.secondary)
                             .padding(.horizontal, 5).padding(.vertical, 4).allowsHitTesting(false)
                     }
                 }
+                .overlay(alignment: .bottomTrailing) { micButton }
+            if let n = dictation.note {
+                Text(n).font(.caption2).foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .disabled(m.isRunning)
+    }
+
+    /// Speak the context instead of typing it. On-device only, in the system
+    /// language (see Dictation.locale).
+    private var micButton: some View {
+        Button {
+            dictation.toggle(current: m.context) { text in
+                PipelineModel.shared.context = text
+            }
+        } label: {
+            Image(systemName: dictation.isListening ? "stop.circle.fill" : "mic.circle")
+                .font(.system(size: 16))
+                .foregroundColor(dictation.isListening ? .red : .secondary)
+        }
+        .buttonStyle(.plain)
+        .help(dictation.isListening ? "Stop dictating" : "Dictate the context (on-device)")
+        .padding(4)
     }
 
     private var controls: some View {

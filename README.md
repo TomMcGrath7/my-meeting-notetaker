@@ -252,6 +252,22 @@ open build/DropMemo.app            # or: cp -R build/DropMemo.app /Applications/
 It registers as a handler for `.m4a/.wav/.mp3`, so **Open With ▸ DropMemo** and
 dropping a memo on its Dock icon both work.
 
+The **context** box has a mic button: click it to dictate the description of the
+call instead of typing it, click again (or stop talking) to finish. Words land in
+the box as you speak, appended to whatever is already there, and the border turns
+red while it is listening.
+
+Recognition is **on-device only** (`requiresOnDeviceRecognition`), in your
+system language, and the app refuses to dictate rather than fall back to Apple's
+servers. If it tells you there is no on-device model for your language, add it
+under **System Settings ▸ Keyboard ▸ Dictation ▸ Edit Languages** and reopen the
+app. Note that `nl-NL` has no offline model by default, and that the **Lang**
+field is deliberately *not* used here: that one describes the recording, this box
+is your own note about it.
+
+First click prompts for Microphone and Speech Recognition. Because the app is
+ad-hoc signed, macOS may re-prompt after a rebuild.
+
 **Shortcut (no Xcode needed)** — make a Shortcut that **Receives audio**, then
 **Run Shell Script** with:
 

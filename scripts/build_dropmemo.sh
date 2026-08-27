@@ -53,6 +53,13 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>NSPrincipalClass</key>        <string>NSApplication</string>
   <key>NSHighResolutionCapable</key> <true/>
   <key>LSApplicationCategoryType</key> <string>public.app-category.productivity</string>
+  <!-- Dictation on the context field. Both keys are mandatory: without them the
+       authorization request traps instead of prompting. Recognition is forced
+       on-device (see Dictation in DropMemoApp.swift), so no audio leaves the Mac. -->
+  <key>NSMicrophoneUsageDescription</key>
+  <string>DropMemo uses the microphone so you can dictate the meeting context instead of typing it.</string>
+  <key>NSSpeechRecognitionUsageDescription</key>
+  <string>DropMemo transcribes that dictation on-device to fill in the meeting context. Nothing is sent to Apple.</string>
   <key>DMRepoPath</key>              <string>${REPO}</string>
   <key>CFBundleDocumentTypes</key>
   <array>
