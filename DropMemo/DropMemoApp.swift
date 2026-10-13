@@ -22,16 +22,33 @@ import Speech
 
 enum Repo {
     /// Resolution order: DROPMEMO_REPO env → Info.plist "DMRepoPath" (baked in
-    /// at build time) → a sensible default. Keeps the .app relocatable while
+    /// at build time) → the checkout the .app is sitting in (build/DropMemo.app,
+    /// so two levels up) → a sensible default. Keeps the .app relocatable while
     /// still finding the checkout it belongs to.
+    ///
+    /// Every candidate but the env var has to actually hold a scripts/process.sh
+    /// to win. A baked path outlives the checkout being moved, and a stale one
+    /// that points at where the repo used to be is worse than no bake at all —
+    /// the app is usually inside the checkout that just moved with it.
     static var path: String {
         if let env = ProcessInfo.processInfo.environment["DROPMEMO_REPO"], !env.isEmpty {
             return (env as NSString).expandingTildeInPath
         }
-        if let baked = Bundle.main.object(forInfoDictionaryKey: "DMRepoPath") as? String, !baked.isEmpty {
-            return (baked as NSString).expandingTildeInPath
+        let baked = Bundle.main.object(forInfoDictionaryKey: "DMRepoPath") as? String
+        // .../<repo>/build/DropMemo.app -> .../<repo>
+        let alongside = Bundle.main.bundleURL
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .path
+        let fallback = "~/GitHub/my-meeting-notetaker"
+        for candidate in [baked, alongside, fallback] {
+            guard let candidate = candidate, !candidate.isEmpty else { continue }
+            let expanded = (candidate as NSString).expandingTildeInPath
+            if FileManager.default.isExecutableFile(atPath: expanded + "/scripts/process.sh") {
+                return expanded
+            }
         }
-        return (("~/Documents/GitHub/my-meeting-notetaker") as NSString).expandingTildeInPath
+        return (fallback as NSString).expandingTildeInPath
     }
 
     static var processSh: String { path + "/scripts/process.sh" }
@@ -193,8 +210,11 @@ final class PipelineModel: ObservableObject {
     @Published var lastOutDir: String?
 
     // Controls strip
-    @Published var backend: Backend = .ollama
-    @Published var model: String = "qwen3-coder:latest"
+    // Claude-sub by default: the two text steps are the ones that want a strong
+    // model, and running them off-box costs this Mac no RAM. An 18 GB local
+    // model beside an IDE and a VM is what took the machine down on 2026-08-27.
+    @Published var backend: Backend = .claudeSub
+    @Published var model: String = "sonnet"
     @Published var denoise = false
     @Published var diarize: DiarizeEngine = .pyannote
     @Published var asrModel: String = "1.7B"          // 0.6B = faster, 1.7B = accurate
@@ -215,7 +235,9 @@ final class PipelineModel: ObservableObject {
     /// Default model name to show when the backend toggles.
     func backendChanged() {
         switch backend {
-        case .ollama:    if model.isEmpty || model.contains("claude") || model.contains("sonnet") || model.contains("opus") { model = "qwen3-coder:latest" }
+        // qwen3:8b (~5 GB) rather than qwen3-coder:latest (18 GB) — the local
+        // default has to fit beside whatever else is already open.
+        case .ollama:    if model.isEmpty || model.contains("claude") || model.contains("sonnet") || model.contains("opus") { model = "qwen3:8b" }
         case .claudeSub: model = "sonnet"
         case .anthropic: if model.isEmpty || !model.contains("claude") { model = "claude-opus-4-8" }
         }

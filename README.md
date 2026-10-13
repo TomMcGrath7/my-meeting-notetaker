@@ -168,12 +168,19 @@ your LiteLLM router, or even speech-swift's own `speech-server`:
 python3 notetaker.py run meeting.m4a \
   --llm-backend openai \
   --base-url http://localhost:11434 \
-  --model-llm qwen3-coder
+  --model-llm qwen3:8b
 ```
 
 A frontier model is meaningfully better at the messy attribution step; a strong
 local model is fine for notes. Mixing — local for one, cloud for the other — is
 just two separate invocations on `--from-json`.
+
+> **Size the local model against your free RAM, not your total RAM.** Ollama
+> holds the whole model resident for the length of the run. `qwen3-coder:latest`
+> is 18 GB; on a 24 GB machine with an IDE and a VM already up, loading it
+> pushed the system into swap thrash hard enough that WindowServer missed its
+> watchdog and the session died. `qwen3:8b` (~5 GB) is the safe local default.
+> `scripts/memory-guard.sh` in Personal-AI-Brain sheds apps before that point.
 
 ### Frontier quality on your Claude subscription (no API key)
 
@@ -181,6 +188,13 @@ just two separate invocations on `--from-json`.
 binary, so they run on your **Claude Pro/Max subscription** instead of the
 pay-per-token API — no `ANTHROPIC_API_KEY`, no per-call cost (subscription rate
 limits apply). In DropMemo this is the **Claude (sub)** backend.
+
+**This is the default** for `scripts/process.sh` and DropMemo (since
+2026-08-27). It is the best of the three on every axis that matters here: it is
+the frontier quality the attribution step wants, it costs nothing on a Max plan,
+and the work happens off-box, so it adds no memory pressure to a machine that is
+already running local diarization and alignment. Override with `LLM_BACKEND=openai`
+(plus `OLLAMA_MODEL`) to go fully offline.
 
 ```bash
 python3 notetaker.py run meeting.m4a --llm-backend claude-cli --model-llm sonnet
