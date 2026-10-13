@@ -12,13 +12,17 @@ guard the timestamp-collapse bug:
   - merge / _turn_for                           : word→speaker attribution.
   - align_words                                 : chunk stitching, proportional
     text split, and the collapse guard / --strict behaviour.
+  - llm (openai backend)                        : a prompt the server clipped to
+    its context window must fail loudly, not come back as partial notes.
 """
 
 import io
 import json
+import os
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
+from unittest import mock
 
 import notetaker as N
 
@@ -335,6 +339,102 @@ class TestTidySegments(unittest.TestCase):
         twice = N.tidy_segments(once)
         self.assertEqual([(s.speaker, s.text) for s in once],
                          [(s.speaker, s.text) for s in twice])
+
+
+
+# --------------------------------------------------------------------------- #
+# llm(): a prompt clipped to the server's context window is not a result
+# --------------------------------------------------------------------------- #
+
+class _FakeResponse:
+    def __init__(self, payload):
+        self._raw = json.dumps(payload).encode()
+
+    def read(self):
+        return self._raw
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class TestPromptTruncation(unittest.TestCase):
+    """Regression (to-do #264): Ollama cut a long transcript to its default
+    context window and the notes covered part of the meeting, with no error.
+    The HTTP call is faked; no server and no model is touched."""
+
+    KW = dict(backend="openai", model="qwen3:8b",
+              base_url="http://localhost:11434", max_tokens=4000)
+
+    def _call(self, transcript, usage):
+        payload = {"choices": [{"message": {"content": "## Summary\nnotes"}}]}
+        if usage is not None:
+            payload["usage"] = usage
+        self.sent = []
+
+        def fake_urlopen(req, timeout=None):
+            self.sent.append(req)
+            return _FakeResponse(payload)
+
+        with mock.patch.object(N.urllib.request, "urlopen", fake_urlopen):
+            return N.llm([{"role": "user", "content": transcript}], "system",
+                         **self.KW)
+
+    def setUp(self):
+        patcher = mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop("NOTETAKER_ALLOW_TRUNCATED", None)
+
+    # ~1 hour of speech: 60k characters, about 15k tokens.
+    LONG = "Tom: we agreed the launch moves to the ninth. " * 1300
+
+    def test_long_transcript_clipped_to_default_window_exits(self):
+        with self.assertRaises(SystemExit) as cm:
+            self._call(self.LONG, {"prompt_tokens": 4096})
+        msg = str(cm.exception)
+        self.assertIn(f"{len(self.LONG) + len('system'):,} characters", msg)
+        self.assertIn("4,096 tokens", msg)
+        self.assertIn("qwen3:8b", msg)
+        # the suggested size must actually hold what was sent
+        self.assertIn("OLLAMA_CONTEXT_LENGTH=32768", msg)
+
+    def test_long_transcript_fully_read_returns_notes(self):
+        out = self._call(self.LONG, {"prompt_tokens": len(self.LONG) // 4})
+        self.assertEqual(out, "## Summary\nnotes")
+
+    def test_short_transcript_is_never_flagged(self):
+        # 10 tokens reported for 3k characters is an odd count, not a cut:
+        # nothing this short can overflow a context window.
+        out = self._call("Tom: hello there. " * 150, {"prompt_tokens": 10})
+        self.assertEqual(out, "## Summary\nnotes")
+
+    def test_no_usage_reported_cannot_be_judged(self):
+        self.assertEqual(self._call(self.LONG, None), "## Summary\nnotes")
+        self.assertEqual(self._call(self.LONG, {"prompt_tokens": 0}),
+                         "## Summary\nnotes")
+
+    def test_override_downgrades_to_a_warning(self):
+        os.environ["NOTETAKER_ALLOW_TRUNCATED"] = "1"
+        err = io.StringIO()
+        with redirect_stderr(err):
+            out = self._call(self.LONG, {"prompt_tokens": 4096})
+        self.assertEqual(out, "## Summary\nnotes")
+        self.assertIn("read only 4,096 tokens", err.getvalue())
+
+    def test_request_still_goes_to_the_openai_compatible_endpoint(self):
+        # Pins the path: this endpoint has no context-size field, which is
+        # why the guard is a check on the answer and not a bigger request.
+        self._call("hi", None)
+        self.assertEqual(self.sent[0].full_url,
+                         "http://localhost:11434/v1/chat/completions")
+        self.assertNotIn("num_ctx", self.sent[0].data.decode())
+
+    def test_suggested_context_holds_prompt_and_reply(self):
+        self.assertEqual(N._suggest_ctx(9000), 8192)      # 3000 + 4000
+        self.assertEqual(N._suggest_ctx(60000), 32768)    # 20000 + 4000
 
 
 if __name__ == "__main__":
