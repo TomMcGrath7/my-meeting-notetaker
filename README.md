@@ -346,7 +346,7 @@ through. `--llm-backend claude-cli` has no such limit.
 ## Front-ends
 
 So you never deal with paths, three layers all call the **same**
-`scripts/process.sh` (local-Ollama defaults + a timestamped out-dir):
+`scripts/process.sh` (Claude-subscription defaults + a timestamped out-dir):
 
 **`scripts/process.sh`** — the single source of truth. Pass an audio file plus
 any extra `notetaker.py` flags:
@@ -356,7 +356,8 @@ scripts/process.sh "~/Desktop/Weekly sync.m4a"            # uses your defaults
 scripts/process.sh call.m4a --denoise --cluster-threshold 0.55
 ```
 
-Override via env: `OLLAMA_MODEL`, `OLLAMA_URL`, `LLM_BACKEND`, `OUT_ROOT`.
+Override via env: `LLM_BACKEND` (default `claude-cli`), `CLAUDE_MODEL` (default
+`sonnet`), `OLLAMA_MODEL` (default `qwen3:8b`), `OLLAMA_URL`, `OUT_ROOT`.
 `LLM_BACKEND=openai` has always meant local Ollama here, and the script now
 runs it as `--llm-backend ollama` (`LLM_BACKEND=ollama` is the same thing).
 Append `--llm-backend openai` to force the older call.
@@ -372,7 +373,8 @@ much better text, especially non-English), watch the pipeline stream live, and
 
 ```bash
 scripts/build_dropmemo.sh          # → build/DropMemo.app (swiftc, ad-hoc signed)
-open build/DropMemo.app            # or: cp -R build/DropMemo.app /Applications/
+open build/DropMemo.app
+scripts/build_dropmemo.sh --install   # also replace /Applications/DropMemo.app
 ```
 
 It registers as a handler for `.m4a/.wav/.mp3`, so **Open With ▸ DropMemo** and

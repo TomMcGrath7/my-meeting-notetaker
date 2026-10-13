@@ -13,7 +13,8 @@
 #   scripts/process.sh /path/to/recording.m4a [extra notetaker flags...]
 #
 # Override defaults via env (handy from the app's controls strip / a Shortcut):
-#   LLM_BACKEND    openai | claude-cli | anthropic  (default: claude-cli, which
+#   LLM_BACKEND    openai | ollama | claude-cli | anthropic  (default: claude-cli;
+#                  openai and ollama both mean local Ollama here. claude-cli
 #                  routes via the `claude` binary / your subscription: $0 on a
 #                  Pro/Max plan and, unlike Ollama, it costs this Mac no RAM)
 #   CLAUDE_MODEL   model for claude-cli    (default: sonnet)
