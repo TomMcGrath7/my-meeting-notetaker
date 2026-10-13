@@ -195,6 +195,31 @@ python3 notetaker.py run meeting.m4a --llm-backend claude-cli --model-llm sonnet
 > 4096-token context can't hold a full meeting transcript without chunking.
 > Target Ollama with a 14B+ model instead.
 
+### Long meetings on a local model (context window)
+
+A local server loads a model with a fixed context window, and Ollama's default
+is small (a few thousand tokens). An hour of talk is around 15,000. A prompt
+longer than the window is **cut to fit, with no error**, so the notes used to
+come back covering only part of the meeting.
+
+notetaker cannot ask for a bigger window from here: the OpenAI-compatible
+`/v1/chat/completions` endpoint has no field for it (Ollama's `num_ctx` exists
+only on its native `/api/chat`). So it checks the answer instead. The server
+reports how many prompt tokens it actually read, and if that is far fewer than
+the prompt holds, the run stops and says how long the prompt was, how much of it
+was read, and what context size would fit it. Fix it on the server:
+
+```bash
+OLLAMA_CONTEXT_LENGTH=32768 ollama serve        # or, per model, a Modelfile:
+#   FROM qwen3:8b
+#   PARAMETER num_ctx 32768
+```
+
+A bigger window costs RAM on top of the model itself, so size it to the
+meeting, not to the maximum. `--llm-backend claude-cli` has no such limit.
+`NOTETAKER_ALLOW_TRUNCATED=1` turns the stop into a warning. A server that
+reports no `usage.prompt_tokens` cannot be checked and is let through.
+
 ## Tuning
 
 - **Diarizer:** `--diarize-engine pyannote` (default, segmentation + speaker

@@ -458,7 +458,56 @@ def llm(messages: list[dict], system: str, *, backend: str, model: str,
         headers = {"content-type": "application/json",
                    "authorization": f"Bearer {key}"}
         data = _post(url, body, headers)
+        sent = len(system) + sum(len(m.get("content") or "") for m in messages)
+        _check_prompt_arrived(sent, data, model)
         return data["choices"][0]["message"]["content"]
+
+# A local server (Ollama above all) clips a prompt longer than the model's
+# loaded context window and answers from what is left. Nothing errors, so a
+# long meeting came back with notes covering part of it and no sign that
+# anything was missing. /v1/chat/completions has no field for a context size
+# (Ollama's `options.num_ctx` is native /api/chat only, and is ignored here),
+# so this path cannot ask for a bigger window. What it can do is refuse to pass
+# a clipped answer off as a whole one: the server reports how many prompt
+# tokens it actually read, and real text does not run past ~5 characters a
+# token, so a count far below what was sent means part of the prompt was cut.
+MAX_CHARS_PER_TOKEN = 6.0
+# Below this nothing is checked: a prompt this short fits the smallest default
+# window any of these servers ship (2048 tokens), and the ratio is noise.
+TRUNCATION_MIN_CHARS = 8000
+ALLOW_TRUNCATED_ENV = "NOTETAKER_ALLOW_TRUNCATED"
+
+def _check_prompt_arrived(sent_chars: int, data: dict, model: str) -> None:
+    """Exit loudly if the server read far fewer tokens than the prompt holds.
+    A response without `usage.prompt_tokens` cannot be judged and passes."""
+    if sent_chars < TRUNCATION_MIN_CHARS:
+        return
+    read = (data.get("usage") or {}).get("prompt_tokens")
+    if not isinstance(read, int) or read <= 0:
+        return
+    if sent_chars / read <= MAX_CHARS_PER_TOKEN:
+        return
+    msg = (f"the prompt was {sent_chars:,} characters (about "
+           f"{sent_chars // 4:,} tokens) but {model} read only {read:,} "
+           f"tokens of it, so the transcript was cut to fit the model's "
+           f"context window and the result would cover only part of the "
+           f"meeting. Raise the server's context size (Ollama: "
+           f"OLLAMA_CONTEXT_LENGTH={_suggest_ctx(sent_chars)} on `ollama serve`, "
+           f"or a Modelfile with PARAMETER num_ctx), or use "
+           f"--llm-backend claude-cli.")
+    if os.environ.get(ALLOW_TRUNCATED_ENV) == "1":
+        print(f"warning: {msg}", file=sys.stderr)
+        return
+    sys.exit(f"error: {msg} (Set {ALLOW_TRUNCATED_ENV}=1 to continue anyway.)")
+
+def _suggest_ctx(sent_chars: int, reply_tokens: int = 4000) -> int:
+    """A context size that holds the prompt plus the reply, as a power of two.
+    3 characters a token is deliberately pessimistic (Dutch, names, numbers)."""
+    need = sent_chars // 3 + reply_tokens
+    ctx = 4096
+    while ctx < need:
+        ctx *= 2
+    return ctx
 
 def _post(url: str, body: dict, headers: dict, timeout: int = 600) -> dict:
     # Local models (e.g. a 30B via Ollama) can cold-load for a minute+ before
