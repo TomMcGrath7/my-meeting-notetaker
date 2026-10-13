@@ -1,0 +1,16 @@
+# OPTIONAL, and only installable with access to the private llm-seam repo
+# (plus Python 3.10 or newer, which llm-seam requires).
+#
+#   pip install -r requirements.txt -r requirements-llm-seam.txt
+#
+# What it adds:
+#   --llm-backend ollama      sizes Ollama's context window to the meeting
+#                             (OllamaClient's num_ctx, new in 0.8.0)
+#   --llm-backend claude-cli  runs on a Claude subscription
+# Without it the notetaker still runs: `ollama` falls back to the older
+# OpenAI-compatible call, which stops on a meeting too long for the server's
+# context window instead of sizing one. See "Long meetings" in the README.
+#
+# Pinned to a release tag. With llm-seam checked out beside this repo,
+# `pip install -e ../llm-seam` tracks that checkout instead.
+llm-seam @ git+https://github.com/TomMcGrath7/llm-seam@v0.8.0

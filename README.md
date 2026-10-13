@@ -43,11 +43,41 @@ brew install ffmpeg
 # 3. python deps (just PyYAML; everything else is stdlib)
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
+#    Optional, see "Do you have access to llm-seam?" below:
+# .venv/bin/pip install -r requirements-llm-seam.txt
 
 # 4. LLM credentials — cloud (text only leaves device):
 export ANTHROPIC_API_KEY=sk-ant-...
 #    …or fully local, see "Going fully offline" below.
 ```
+
+### Do you have access to llm-seam?
+
+Two backends (`ollama` and `claude-cli`) go through
+[`llm-seam`](https://github.com/TomMcGrath7/llm-seam), a small shared wrapper
+that lives in a **private** repo. It is optional, and the notetaker runs
+without it.
+
+**Without access** (the usual case if you were given this repo only): install
+`requirements.txt` and nothing else. Everything works except two things.
+`--llm-backend claude-cli` is unavailable and says so. `--llm-backend ollama`
+falls back to the older OpenAI-compatible call and prints one line telling you
+it did: short meetings are unaffected, and a meeting too long for your Ollama
+server's context window stops with an error that says what to set on the
+server (see [Long meetings](#long-meetings-on-a-local-model-context-window)).
+`--llm-backend anthropic` and `--llm-backend openai` never needed it.
+
+**With access:** build the venv on Python 3.10 or newer (llm-seam requires it;
+the macOS system `python3` is 3.9 and will not do), then add the second file:
+
+```bash
+python3.12 -m venv .venv          # any python >= 3.10
+.venv/bin/pip install -r requirements.txt -r requirements-llm-seam.txt
+```
+
+That pins llm-seam to a release tag (`v0.8.0`, the first with the context-size
+option). With llm-seam checked out beside this repo,
+`.venv/bin/pip install -e ../llm-seam` follows that checkout instead.
 
 ## Recording the meeting
 
@@ -151,6 +181,16 @@ python3 notetaker.py run meeting.m4a --transcript voice-memo.txt
 python3 -m unittest discover -s tests -v
 ```
 
+The tests that drive llm-seam's Ollama client are skipped when llm-seam is not
+installed, and the fallback tests run either way. To run all of them without
+touching your venv:
+
+```bash
+uv run -q --with-requirements requirements.txt \
+    --with-requirements requirements-llm-seam.txt \
+    python -m unittest discover -s tests
+```
+
 Stdlib `unittest` only (no extra deps), no audio/model/network — runs in
 milliseconds. Covers the pure functions that actually break things: the
 `diarize`/`align` output parsers (pinned against captured real `speech` output
@@ -161,15 +201,22 @@ shows a new output format, re-capture the fixtures.
 
 ## Going fully offline
 
-The two LLM steps take an OpenAI-compatible endpoint, so use Ollama, LM Studio,
-your LiteLLM router, or even speech-swift's own `speech-server`:
+The two LLM steps can run on a local model. For Ollama:
 
 ```bash
 python3 notetaker.py run meeting.m4a \
-  --llm-backend openai \
+  --llm-backend ollama \
   --base-url http://localhost:11434 \
   --model-llm qwen3-coder
 ```
+
+`--base-url` defaults to `http://localhost:11434` and may be written with or
+without a trailing `/v1`. For any other OpenAI-compatible server (LM Studio,
+your LiteLLM router, speech-swift's own `speech-server`) use
+`--llm-backend openai --base-url http://localhost:1234`. That is also the older
+way to reach Ollama; it still works but is deprecated there, because it cannot
+size the context window (see
+[Long meetings](#long-meetings-on-a-local-model-context-window)).
 
 A frontier model is meaningfully better at the messy attribution step; a strong
 local model is fine for notes. Mixing — local for one, cloud for the other — is
@@ -202,12 +249,50 @@ is small (a few thousand tokens). An hour of talk is around 15,000. A prompt
 longer than the window is **cut to fit, with no error**, so the notes used to
 come back covering only part of the meeting.
 
-notetaker cannot ask for a bigger window from here: the OpenAI-compatible
-`/v1/chat/completions` endpoint has no field for it (Ollama's `num_ctx` exists
-only on its native `/api/chat`). So it checks the answer instead. The server
-reports how many prompt tokens it actually read, and if that is far fewer than
-the prompt holds, the run stops and says how long the prompt was, how much of it
-was read, and what context size would fit it. Fix it on the server:
+**`--llm-backend ollama` asks for a window that fits.** It talks to Ollama's
+native `/api/chat` (through llm-seam), which takes a context size per request.
+For each of the two LLM steps the notetaker:
+
+1. estimates the prompt at 3 characters a token (deliberately high: speech is
+   4 or more), adds the reply budget, and rounds up to the next 2,048;
+2. asks Ollama for exactly that window, so a ten-minute memo gets a small one
+   and an hour gets about 24,000;
+3. **refuses to run** if that is more than the cap, and says how long the
+   prompt is, what window it needs and what the cap is. It never cuts;
+4. checks the answer: Ollama reports how many prompt tokens the model actually
+   read, and if that is far fewer than were sent, or it filled the whole
+   window, the run stops.
+
+The cap is `num_ctx_max`, 32,768 tokens by default, which is about 95 minutes
+of talk. A context window is RAM on top of the model itself: at 32,768 it is
+roughly 5 GB extra for `qwen3:8b` or `qwen3:14b` (an estimate from the models'
+shapes, not a measurement), which a 24 GB Mac can hold; 65,536 would double
+that. Set it lower on a smaller machine or higher on a
+bigger one, in any of three places (first one wins):
+
+```bash
+python3 notetaker.py run meeting.m4a --llm-backend ollama --num-ctx-max 65536
+NOTETAKER_NUM_CTX_MAX=65536 scripts/process.sh meeting.m4a
+```
+
+```yaml
+# config.yaml (DropMemo rewrites this file on every run, so from DropMemo use
+# the environment variable)
+num_ctx_max: 65536
+```
+
+Two things to know. Ollama reloads the model when the window size changes, so
+the first LLM step of a long meeting takes a little longer to start. And a
+meeting too long for any window you can afford still needs `--llm-backend
+claude-cli`; splitting a transcript into chunks and merging the notes is not
+built yet.
+
+**Without llm-seam, or with `--llm-backend openai`,** the request goes to the
+OpenAI-compatible `/v1/chat/completions`, which has no field for a context
+size. That path cannot ask, so it only checks: if the server read far fewer
+prompt tokens than the prompt holds, the run stops and says how long the prompt
+was, how much of it was read, and what context size would fit it. Fix it on the
+server:
 
 ```bash
 OLLAMA_CONTEXT_LENGTH=32768 ollama serve        # or, per model, a Modelfile:
@@ -215,10 +300,9 @@ OLLAMA_CONTEXT_LENGTH=32768 ollama serve        # or, per model, a Modelfile:
 #   PARAMETER num_ctx 32768
 ```
 
-A bigger window costs RAM on top of the model itself, so size it to the
-meeting, not to the maximum. `--llm-backend claude-cli` has no such limit.
-`NOTETAKER_ALLOW_TRUNCATED=1` turns the stop into a warning. A server that
-reports no `usage.prompt_tokens` cannot be checked and is let through.
+On every path, `NOTETAKER_ALLOW_TRUNCATED=1` turns the stop into a warning, and
+a server that reports no prompt token count cannot be checked and is let
+through. `--llm-backend claude-cli` has no such limit.
 
 ## Tuning
 
@@ -259,6 +343,9 @@ scripts/process.sh call.m4a --denoise --cluster-threshold 0.55
 ```
 
 Override via env: `OLLAMA_MODEL`, `OLLAMA_URL`, `LLM_BACKEND`, `OUT_ROOT`.
+`LLM_BACKEND=openai` has always meant local Ollama here, and the script now
+runs it as `--llm-backend ollama` (`LLM_BACKEND=ollama` is the same thing).
+Append `--llm-backend openai` to force the older call.
 
 **DropMemo** (macOS app) — one window: drag a memo onto it (or use the file
 picker), set **who's in the meeting** (the participants + context fields write

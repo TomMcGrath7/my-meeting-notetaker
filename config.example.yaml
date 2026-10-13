@@ -17,3 +17,11 @@ context: |
   Marina joins occasionally and is dialing in from a phone, so her audio is
   thinner than the others. Topics this week: API hardening sprint, launch
   timeline, invoicing.
+
+# Optional, `--llm-backend ollama` only. The largest context window, in tokens,
+# the notetaker may ask Ollama for. It sizes the window to each meeting, and a
+# bigger window is RAM on top of the model itself, so this is the ceiling on
+# that. The default (32768) is about 95 minutes of talk and fits a 24 GB Mac
+# with a 14B model. A meeting that does not fit stops with an error and the
+# numbers; nothing is cut silently. `--num-ctx-max` overrides this.
+# num_ctx_max: 32768
