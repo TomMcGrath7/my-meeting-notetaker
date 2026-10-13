@@ -14,7 +14,8 @@ Pipeline (each stage runs alone, so peak RAM ~= the single biggest model):
 
 Only TEXT ever leaves the device (the two LLM steps). Audio + diarization +
 ASR are 100% local via the `speech` binary (github.com/soniqo/speech-swift).
-Point --llm-backend at a local OpenAI-compatible endpoint to keep it ALL local.
+Point --llm-backend at a local model (ollama, or openai for any other
+OpenAI-compatible server) to keep it ALL local.
 
 The two parsers most likely to need tweaking for your `speech` version are
 parse_diarize() and parse_align(). Run `notetaker.py check <file>` first — it
@@ -25,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import shutil
@@ -36,7 +38,9 @@ import urllib.error
 from dataclasses import dataclass, asdict, field, replace
 from pathlib import Path
 
-from llm_seam import ClaudeCli, LlmSeamError
+# llm-seam (Tom's shared LLM wrapper, a private repo) is OPTIONAL and is
+# imported where it is used, never here: people with access to this repo but
+# not to llm-seam must still be able to run the notetaker. See _llm_seam().
 
 # --------------------------------------------------------------------------- #
 # small helpers
@@ -416,13 +420,73 @@ def tidy_segments(segs: list[Segment]) -> list[Segment]:
 # stage 5/6 — LLM: relabel + correct, then notes  (text only)
 # --------------------------------------------------------------------------- #
 
+# The newest llm-seam feature this file relies on: OllamaClient(num_ctx=...).
+LLM_SEAM_MIN_VERSION = "0.8.0"
+LLM_SEAM_INSTALL = "pip install -r requirements-llm-seam.txt (Python 3.10+)"
+
+def _llm_seam():
+    """`(llm_seam, None)`, or `(None, why)` when it cannot be used here.
+
+    Imported lazily and never at module level, so a machine without llm-seam
+    still runs every stage that does not need it. A copy too old to size the
+    context window counts as absent: calling it with `num_ctx=` would be a
+    TypeError, and dropping the argument would be the silent clip again."""
+    try:
+        import llm_seam
+    except ImportError:
+        return None, "llm-seam is not installed"
+    if "num_ctx" not in getattr(llm_seam.OllamaClient, "ACCEPTS", ()):
+        return None, (f"llm-seam {getattr(llm_seam, '__version__', '?')} is "
+                      f"older than {LLM_SEAM_MIN_VERSION}")
+    return llm_seam, None
+
+_noticed: set = set()
+
+def _notice_once(text: str) -> None:
+    """One line on stderr, once a run (llm() is called twice: labels, notes)."""
+    if text not in _noticed:
+        _noticed.add(text)
+        print(f"note: {text}", file=sys.stderr)
+
+def _server_root(base_url: str) -> str:
+    """The host root of a local server, whichever way the URL was spelled.
+    `http://localhost:11434`, `.../` and `.../v1` are all in use (OLLAMA_URL is
+    documented as "OpenAI-compatible URL", which invites the /v1 form). The
+    native client needs the bare root, and the /v1 path appends its own /v1."""
+    root = base_url.strip().rstrip("/")
+    if root.endswith("/v1"):
+        root = root[:-len("/v1")].rstrip("/")
+    return root
+
 def llm(messages: list[dict], system: str, *, backend: str, model: str,
-        base_url: str, max_tokens: int) -> str:
-    """Minimal LLM call. backend='anthropic' (API key), 'openai'
-    (OpenAI-compatible, e.g. Ollama), or 'claude-cli' (the local `claude`
-    binary → your Claude Pro/Max subscription, no API key / no per-token cost,
-    via llm-seam)."""
+        base_url: str, max_tokens: int,
+        num_ctx_max: int | None = None) -> str:
+    """Minimal LLM call. backend='anthropic' (API key), 'ollama' (a local
+    Ollama, with the context window sized to the prompt, via llm-seam),
+    'openai' (any OpenAI-compatible server), or 'claude-cli' (the local
+    `claude` binary → your Claude Pro/Max subscription, no API key / no
+    per-token cost, via llm-seam)."""
+    if backend == "ollama":
+        seam, why = _llm_seam()
+        if seam is not None:
+            return _ollama_native(seam, messages, system, model=model,
+                                  base_url=base_url, max_tokens=max_tokens,
+                                  num_ctx_max=num_ctx_max or DEFAULT_NUM_CTX_MAX)
+        _notice_once(f"{why}, so this run uses the deprecated /v1 path, which "
+                     f"cannot ask Ollama for a bigger context window (a long "
+                     f"meeting stops with an error instead of being clipped). "
+                     f"To fix: {LLM_SEAM_INSTALL}.")
+        backend = "openai"
+    elif backend == "openai":
+        _notice_once("--llm-backend openai cannot size the context window. "
+                     "If this server is Ollama, use --llm-backend ollama.")
     if backend == "claude-cli":
+        seam, why = _llm_seam()
+        if seam is None:
+            sys.exit(f"error: --llm-backend claude-cli needs llm-seam, and "
+                     f"{why}. {LLM_SEAM_INSTALL}, or use --llm-backend "
+                     f"anthropic / ollama.")
+        ClaudeCli, LlmSeamError = seam.ClaudeCli, seam.LlmSeamError
         user = "\n\n".join(m["content"] for m in messages if m.get("role") == "user")
         cli = ClaudeCli(
             model=model or None,   # e.g. "sonnet", "opus", or a full id
@@ -450,9 +514,32 @@ def llm(messages: list[dict], system: str, *, backend: str, model: str,
         data = _post(url, body, headers)
         return "".join(b.get("text", "") for b in data.get("content", [])
                        if b.get("type") == "text")
-    else:  # openai-compatible (LM Studio, LiteLLM, vLLM, speech-server, ...)
+    else:
+        # DEPRECATED for Ollama (2026-10-13), kept on purpose. Do not delete.
+        #
+        # This hand-built POST to /v1/chat/completions was the only local path
+        # until `ollama` above replaced it. It stays for two reasons:
+        #   1. People who can read this repo but not llm-seam (a private repo)
+        #      have no other way to reach a local model. `--llm-backend ollama`
+        #      lands here by itself when llm-seam cannot be imported.
+        #   2. It is still the way to any OTHER OpenAI-compatible server (LM
+        #      Studio, LiteLLM, vLLM, speech-server), and to an Ollama behind a
+        #      proxy that wants the `Authorization` header sent below.
+        # What it cannot do is ask for a context window: this protocol has no
+        # field for one. So a long transcript is checked after the fact by
+        # _check_prompt_arrived and the run stops if it was clipped.
+        #
+        # How the new path is built, for whoever has to rebuild it without
+        # llm-seam: POST {root}/api/chat (Ollama's native endpoint) with
+        #   {"model": ..., "stream": false, "think": false,
+        #    "messages": [{"role": "system", ...}, {"role": "user", ...}],
+        #    "options": {"temperature": 0.0, "num_predict": <reply budget>,
+        #                "num_ctx": <_size_num_ctx(...)>}}
+        # and read `message.content`, `prompt_eval_count` (prompt tokens the
+        # model actually read, fed to _check_window_held) and `done_reason`
+        # ("length" means the reply hit num_predict). See _ollama_native.
         key = os.environ.get("OPENAI_API_KEY", "not-needed")
-        url = base_url.rstrip("/") + "/v1/chat/completions"
+        url = _server_root(base_url) + "/v1/chat/completions"
         body = {"model": model, "max_tokens": max_tokens,
                 "messages": [{"role": "system", "content": system}, *messages]}
         headers = {"content-type": "application/json",
@@ -495,6 +582,10 @@ def _check_prompt_arrived(sent_chars: int, data: dict, model: str) -> None:
            f"OLLAMA_CONTEXT_LENGTH={_suggest_ctx(sent_chars)} on `ollama serve`, "
            f"or a Modelfile with PARAMETER num_ctx), or use "
            f"--llm-backend claude-cli.")
+    _refuse(msg)
+
+def _refuse(msg: str) -> None:
+    """Stop the run, unless the user said a partial result is acceptable."""
     if os.environ.get(ALLOW_TRUNCATED_ENV) == "1":
         print(f"warning: {msg}", file=sys.stderr)
         return
@@ -508,6 +599,134 @@ def _suggest_ctx(sent_chars: int, reply_tokens: int = 4000) -> int:
     while ctx < need:
         ctx *= 2
     return ctx
+
+# --- the Ollama path: ask for a window that holds the prompt ---------------- #
+#
+# Ollama's native /api/chat takes `options.num_ctx`, so this path does what the
+# /v1 one cannot: it sizes the window to the prompt before sending. Three
+# things keep that honest.
+#
+# The estimate is pessimistic. Speech runs 4+ characters a token; 3 leaves room
+# for Dutch, names and the digit-heavy "[412] SPEAKER_03 (2475s):" prefixes of
+# the labelling prompt (a synthetic all-numbers prompt measured 3.06).
+#
+# The window is capped, because it is RAM on top of the model's weights and
+# this runs on a laptop. 32768 is what a 24 GB Mac can hold beside the models
+# this repo recommends: the cache for 32k tokens is roughly 5 GB on qwen3:8b
+# (5 GB of weights) and on qwen3:14b (9 GB), so 10 to 15 GB resident. 65536
+# would double the cache and put a 14B model near 20 GB. (Estimates from the
+# models' layer and head counts at 16-bit, not measurements.) It holds about 95
+# minutes of talk. A prompt that does not fit under the cap is REFUSED with the
+# numbers: clipping it is the bug this path exists to end.
+#
+# The answer is still checked. Ollama reports how many prompt tokens the model
+# read, and _check_window_held compares that with what was sent.
+CHARS_PER_TOKEN_ESTIMATE = 3.0
+NUM_CTX_STEP = 2048          # round up to this, so near-equal prompts share a size
+NUM_CTX_FLOOR = 4096         # Ollama's own default; never ask for less
+DEFAULT_NUM_CTX_MAX = 32768
+NUM_CTX_MAX_ENV = "NOTETAKER_NUM_CTX_MAX"
+OLLAMA_TIMEOUT = 600.0       # a big local model can cold-load for a minute+
+
+def _estimate_tokens(chars: int) -> int:
+    return math.ceil(chars / CHARS_PER_TOKEN_ESTIMATE)
+
+def _size_num_ctx(sent_chars: int, reply_tokens: int, cap: int, model: str) -> int:
+    """The context window to ask for: the prompt (estimated) plus the reply
+    budget, rounded up to NUM_CTX_STEP. Sized to the prompt, never to the cap,
+    so a ten-minute memo does not pay for a two-hour window."""
+    need = _estimate_tokens(sent_chars) + reply_tokens
+    ctx = max(NUM_CTX_FLOOR, math.ceil(need / NUM_CTX_STEP) * NUM_CTX_STEP)
+    if ctx <= cap:
+        return ctx
+    if need <= cap:              # a cap that is not a multiple of the step
+        return cap
+    _refuse(f"the prompt is {sent_chars:,} characters, estimated at "
+            f"{_estimate_tokens(sent_chars):,} tokens, and with {reply_tokens:,} "
+            f"for the reply it needs a context window of {ctx:,}. The cap is "
+            f"{cap:,} (num_ctx_max), so {model} would read only part of the "
+            f"meeting. Raise the cap if this machine has the RAM for it "
+            f"(--num-ctx-max {ctx}, or num_ctx_max: {ctx} in config.yaml), or "
+            f"use --llm-backend claude-cli, which has no such limit. The "
+            f"estimate is deliberately high ({CHARS_PER_TOKEN_ESTIMATE:g} "
+            f"characters a token).")
+    return cap                   # only reached under NOTETAKER_ALLOW_TRUNCATED=1
+
+def _check_window_held(sent_chars: int, read, num_ctx: int, reply_tokens: int,
+                       model: str) -> None:
+    """Compare the prompt tokens Ollama says the model read with what was sent.
+    `read` is llm-seam's `usage.input_tokens` (Ollama's `prompt_eval_count`);
+    None means Ollama did not say, and that cannot be judged."""
+    if not isinstance(read, int) or read <= 0:
+        return
+    estimate = _estimate_tokens(sent_chars)
+    if (sent_chars >= TRUNCATION_MIN_CHARS
+            and sent_chars / read > MAX_CHARS_PER_TOKEN):
+        # Asked for a window and did not get it: the model's own maximum is
+        # smaller, or the server caps it. Same symptom as the /v1 path.
+        _refuse(f"the prompt was {sent_chars:,} characters (estimated "
+                f"{estimate:,} tokens) and a context window of {num_ctx:,} was "
+                f"asked for, but {model} read only {read:,} tokens of it, so "
+                f"the transcript was cut and the result would cover only part "
+                f"of the meeting. Ollama did not give the model that window "
+                f"(the model's own maximum may be smaller). Use a model with "
+                f"a larger context, or --llm-backend claude-cli.")
+        return
+    if read >= num_ctx:
+        _refuse(f"{model} read {read:,} prompt tokens into a context window of "
+                f"{num_ctx:,}: the prompt filled the whole window, so part of "
+                f"it was almost certainly cut. It was estimated at "
+                f"{estimate:,} tokens from {sent_chars:,} characters. Raise "
+                f"num_ctx_max, or use --llm-backend claude-cli.")
+        return
+    if read + reply_tokens > num_ctx:
+        print(f"warning: the prompt was {read:,} tokens, more than the "
+              f"{estimate:,} estimated, which left {num_ctx - read:,} of the "
+              f"{reply_tokens:,} reply tokens budgeted in a window of "
+              f"{num_ctx:,}. The reply finished, so nothing was cut.",
+              file=sys.stderr)
+    elif (sent_chars >= TRUNCATION_MIN_CHARS
+            and abs(read - num_ctx // 2) <= 8 and read < estimate):
+        # Measured live (qwen3.5:2b, 2026-10-13): a prompt cut to a 2048
+        # window came back as 1,026 tokens read, half the window and not the
+        # window. An honest prompt lands this exactly on the half about one
+        # time in a thousand, so this warns and does not stop.
+        print(f"warning: {model} read {read:,} prompt tokens, exactly half of "
+              f"the {num_ctx:,} window. That is what Ollama reports after "
+              f"cutting a prompt that was too long; check that the result "
+              f"covers the START of the meeting.", file=sys.stderr)
+
+def _ollama_native(seam, messages: list[dict], system: str, *, model: str,
+                   base_url: str, max_tokens: int, num_ctx_max: int) -> str:
+    """One turn against Ollama's native /api/chat through llm-seam's
+    OllamaClient, which models `num_ctx` (0.8.0) and raises when the reply
+    hits `max_tokens` instead of returning it cut short."""
+    user = "\n\n".join(m.get("content") or "" for m in messages
+                       if m.get("role") == "user")
+    sent = len(system) + len(user)
+    num_ctx = _size_num_ctx(sent, max_tokens, num_ctx_max, model)
+    client = seam.OllamaClient(_server_root(base_url), model,
+                               timeout=OLLAMA_TIMEOUT)
+    for attempt in (1, 2):
+        try:
+            result = client.complete(system, user, num_ctx=num_ctx,
+                                     max_tokens=max_tokens)
+            break
+        except seam.OllamaError as e:
+            # Same rule as _post below: a lone timeout while a big model
+            # cold-loads is transient and is retried once; an HTTP error or a
+            # reply cut off at max_tokens is an answer, and is not.
+            cause = e.__cause__
+            transient = (isinstance(cause, OSError)
+                         and not isinstance(cause, urllib.error.HTTPError))
+            if transient and attempt == 1:
+                print("  LLM timed out; retrying once…", file=sys.stderr)
+                continue
+            sys.exit(f"error: ollama backend failed ({model}, "
+                     f"num_ctx={num_ctx:,}): {e}")
+    _check_window_held(sent, result.usage.input_tokens, num_ctx, max_tokens,
+                       model)
+    return result.text
 
 def _post(url: str, body: dict, headers: dict, timeout: int = 600) -> dict:
     # Local models (e.g. a 30B via Ollama) can cold-load for a minute+ before
@@ -686,6 +905,32 @@ def cmd_check(args):
         print("\n*** A parser returned nothing. Adjust parse_diarize/parse_align "
               "to match the raw output above. ***")
 
+DEFAULT_BASE_URLS = {
+    "anthropic": "https://api.anthropic.com",
+    "ollama": "http://localhost:11434",
+    "openai": "http://localhost:11434",
+}
+
+def resolve_num_ctx_max(flag, cfg: dict) -> int:
+    """The cap on the Ollama context window: --num-ctx-max, else the
+    NOTETAKER_NUM_CTX_MAX env var, else `num_ctx_max:` in the config, else
+    DEFAULT_NUM_CTX_MAX. (The env var exists because DropMemo rewrites
+    config.yaml from its two text fields on every run.)"""
+    for source, value in (("--num-ctx-max", flag),
+                          (NUM_CTX_MAX_ENV, os.environ.get(NUM_CTX_MAX_ENV)),
+                          ("num_ctx_max in the config", cfg.get("num_ctx_max"))):
+        if value in (None, ""):
+            continue
+        try:
+            cap = int(value)
+        except (TypeError, ValueError):
+            cap = 0
+        if cap <= 0:
+            sys.exit(f"error: {source} must be a positive number of tokens, "
+                     f"got {value!r}.")
+        return cap
+    return DEFAULT_NUM_CTX_MAX
+
 def cmd_run(args):
     cfg = load_config(Path(args.config))
     roster = cfg.get("participants", [])
@@ -693,7 +938,8 @@ def cmd_run(args):
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     llm_kw = dict(backend=args.llm_backend, model=args.model_llm,
-                  base_url=args.base_url)
+                  base_url=args.base_url or DEFAULT_BASE_URLS.get(args.llm_backend, ""),
+                  num_ctx_max=resolve_num_ctx_max(args.num_ctx_max, cfg))
 
     if args.from_json:
         pipe = Pipeline.from_json(Path(args.from_json).read_text())
@@ -841,14 +1087,28 @@ def build_parser() -> argparse.ArgumentParser:
                    help="skip the notes-generation LLM step")
     r.add_argument("--from-json",
                    help="reuse a previous pipeline.json (skip all audio stages)")
-    r.add_argument("--llm-backend", choices=["anthropic", "openai", "claude-cli"],
+    r.add_argument("--llm-backend",
+                   choices=["anthropic", "ollama", "openai", "claude-cli"],
                    default="anthropic",
-                   help="anthropic = API key; openai = OpenAI-compatible (Ollama); "
-                        "claude-cli = local `claude` binary via your subscription")
+                   help="anthropic = API key; ollama = local Ollama, context "
+                        "window sized to the meeting (needs llm-seam; without it "
+                        "this falls back to the openai path); openai = any "
+                        "OpenAI-compatible server (LM Studio, ...; deprecated "
+                        "for Ollama); claude-cli = local `claude` binary via "
+                        "your subscription (needs llm-seam)")
     r.add_argument("--model-llm", default="claude-sonnet-4-6",
-                   help="LLM model id (anthropic) or local model name (openai)")
-    r.add_argument("--base-url", default="https://api.anthropic.com",
-                   help="LLM base URL; for local use e.g. http://localhost:1234")
+                   help="LLM model id (anthropic) or local model name "
+                        "(ollama / openai)")
+    r.add_argument("--base-url", default=None,
+                   help="LLM base URL (default: api.anthropic.com for anthropic, "
+                        "http://localhost:11434 for ollama / openai). A trailing "
+                        "/v1 is accepted and ignored.")
+    r.add_argument("--num-ctx-max", type=int, default=None,
+                   help=f"ollama backend: the largest context window to ask "
+                        f"for, in tokens (default {DEFAULT_NUM_CTX_MAX}, or "
+                        f"num_ctx_max in the config). The window is sized to the "
+                        f"meeting and costs RAM; a meeting that does not fit "
+                        f"under this stops with an error instead of being cut.")
     r.set_defaults(func=cmd_run)
     return p
 
