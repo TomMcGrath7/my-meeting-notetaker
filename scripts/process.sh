@@ -70,8 +70,18 @@ OUT_ROOT="${OUT_ROOT:-$REPO}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 OUT_DIR="$OUT_ROOT/out-$STAMP"
 
+# LLM_BACKEND=openai has always meant "local Ollama" in this script (it is what
+# OLLAMA_URL / OLLAMA_MODEL configure, and what DropMemo sends). notetaker's
+# name for that is now `ollama`: Ollama's native API, which can size the
+# context window to the meeting, where the OpenAI-compatible one silently cut a
+# long transcript. `ollama` is accepted here too. To force the old path, or to
+# reach a different OpenAI-compatible server, append `--llm-backend openai`.
+[[ "$LLM_BACKEND" == "ollama" ]] && LLM_BACKEND="openai"
+NOTETAKER_BACKEND="$LLM_BACKEND"
+[[ "$LLM_BACKEND" == "openai" ]] && NOTETAKER_BACKEND="ollama"
+
 # --- assemble the notetaker invocation ---------------------------------------
-ARGS=(run "$AUDIO" --out-dir "$OUT_DIR" --llm-backend "$LLM_BACKEND")
+ARGS=(run "$AUDIO" --out-dir "$OUT_DIR" --llm-backend "$NOTETAKER_BACKEND")
 
 # Only the OpenAI-compatible (Ollama) path needs base-url + local model name;
 # for --llm-backend anthropic the model id comes from the user's extra flags.

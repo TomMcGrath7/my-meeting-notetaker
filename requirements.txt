@@ -1,3 +1,7 @@
-# Only third-party dep; everything else is Python stdlib.
+# Third-party deps; everything else is Python stdlib.
 # (ffmpeg and the `speech` binary are installed via Homebrew, not pip.)
 PyYAML>=6.0
+# This file installs for everyone and is all the notetaker NEEDS. llm-seam,
+# which the `ollama` and `claude-cli` backends use, is optional and lives in
+# requirements-llm-seam.txt because it is a private repo: listed here, it
+# would fail this install for anyone without access to it.
