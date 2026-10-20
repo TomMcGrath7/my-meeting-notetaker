@@ -13,4 +13,4 @@
 #
 # Pinned to a release tag. With llm-seam checked out beside this repo,
 # `pip install -e ../llm-seam` tracks that checkout instead.
-llm-seam @ git+https://github.com/TomMcGrath7/llm-seam@v0.8.0
+llm-seam @ git+https://github.com/TomMcGrath7/llm-seam@v0.9.0
