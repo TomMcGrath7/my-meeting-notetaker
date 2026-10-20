@@ -207,7 +207,7 @@ The two LLM steps can run on a local model. For Ollama:
 python3 notetaker.py run meeting.m4a \
   --llm-backend ollama \
   --base-url http://localhost:11434 \
-  --model-llm qwen3-coder
+  --model-llm qwen3:8b
 ```
 
 `--base-url` defaults to `http://localhost:11434` and may be written with or
@@ -222,12 +222,26 @@ A frontier model is meaningfully better at the messy attribution step; a strong
 local model is fine for notes. Mixing — local for one, cloud for the other — is
 just two separate invocations on `--from-json`.
 
+> **Size the local model against your free RAM, not your total RAM.** Ollama
+> holds the whole model resident for the length of the run. `qwen3-coder:latest`
+> is 18 GB; on a 24 GB machine with an IDE and a VM already up, loading it
+> pushed the system into swap thrash hard enough that WindowServer missed its
+> watchdog and the session died. `qwen3:8b` (~5 GB) is the safe local default.
+> `scripts/memory-guard.sh` in Personal-AI-Brain sheds apps before that point.
+
 ### Frontier quality on your Claude subscription (no API key)
 
 `--llm-backend claude-cli` routes the two text steps through the local `claude`
 binary, so they run on your **Claude Pro/Max subscription** instead of the
 pay-per-token API — no `ANTHROPIC_API_KEY`, no per-call cost (subscription rate
 limits apply). In DropMemo this is the **Claude (sub)** backend.
+
+**This is the default** for `scripts/process.sh` and DropMemo (since
+2026-08-27). It is the best of the three on every axis that matters here: it is
+the frontier quality the attribution step wants, it costs nothing on a Max plan,
+and the work happens off-box, so it adds no memory pressure to a machine that is
+already running local diarization and alignment. Override with `LLM_BACKEND=openai`
+(plus `OLLAMA_MODEL`) to go fully offline.
 
 ```bash
 python3 notetaker.py run meeting.m4a --llm-backend claude-cli --model-llm sonnet
@@ -332,7 +346,7 @@ through. `--llm-backend claude-cli` has no such limit.
 ## Front-ends
 
 So you never deal with paths, three layers all call the **same**
-`scripts/process.sh` (local-Ollama defaults + a timestamped out-dir):
+`scripts/process.sh` (Claude-subscription defaults + a timestamped out-dir):
 
 **`scripts/process.sh`** — the single source of truth. Pass an audio file plus
 any extra `notetaker.py` flags:
@@ -342,7 +356,8 @@ scripts/process.sh "~/Desktop/Weekly sync.m4a"            # uses your defaults
 scripts/process.sh call.m4a --denoise --cluster-threshold 0.55
 ```
 
-Override via env: `OLLAMA_MODEL`, `OLLAMA_URL`, `LLM_BACKEND`, `OUT_ROOT`.
+Override via env: `LLM_BACKEND` (default `claude-cli`), `CLAUDE_MODEL` (default
+`sonnet`), `OLLAMA_MODEL` (default `qwen3:8b`), `OLLAMA_URL`, `OUT_ROOT`.
 `LLM_BACKEND=openai` has always meant local Ollama here, and the script now
 runs it as `--llm-backend ollama` (`LLM_BACKEND=ollama` is the same thing).
 Append `--llm-backend openai` to force the older call.
@@ -358,11 +373,28 @@ much better text, especially non-English), watch the pipeline stream live, and
 
 ```bash
 scripts/build_dropmemo.sh          # → build/DropMemo.app (swiftc, ad-hoc signed)
-open build/DropMemo.app            # or: cp -R build/DropMemo.app /Applications/
+open build/DropMemo.app
+scripts/build_dropmemo.sh --install   # also replace /Applications/DropMemo.app
 ```
 
 It registers as a handler for `.m4a/.wav/.mp3`, so **Open With ▸ DropMemo** and
 dropping a memo on its Dock icon both work.
+
+The **context** box has a mic button: click it to dictate the description of the
+call instead of typing it, click again (or stop talking) to finish. Words land in
+the box as you speak, appended to whatever is already there, and the border turns
+red while it is listening.
+
+Recognition is **on-device only** (`requiresOnDeviceRecognition`), in your
+system language, and the app refuses to dictate rather than fall back to Apple's
+servers. If it tells you there is no on-device model for your language, add it
+under **System Settings ▸ Keyboard ▸ Dictation ▸ Edit Languages** and reopen the
+app. Note that `nl-NL` has no offline model by default, and that the **Lang**
+field is deliberately *not* used here: that one describes the recording, this box
+is your own note about it.
+
+First click prompts for Microphone and Speech Recognition. Because the app is
+ad-hoc signed, macOS may re-prompt after a rebuild.
 
 **Shortcut (no Xcode needed)** — make a Shortcut that **Receives audio**, then
 **Run Shell Script** with:
