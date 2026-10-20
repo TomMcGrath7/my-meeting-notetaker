@@ -4,9 +4,7 @@ How Tom's [Personal-AI-Brain](https://github.com/TomMcGrath7/Personal-AI-Brain) 
 in this repo. It is read by `brain/code_flow.py::repo_config` when a code task runs
 here, and its presence is what puts this repo in the scope of `/code all`.
 
-No `tests:` line yet: nothing in this repo declares a test runner, so the
-brain reports that tests were not run and will not ship a change from here
-without you looking at it. Add one and that changes.
+tests: uv run -q --with-requirements requirements.txt python -m unittest discover -s tests
 
 
 ## What a code task does here
