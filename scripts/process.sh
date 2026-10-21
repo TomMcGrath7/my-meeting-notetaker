@@ -25,6 +25,12 @@
 
 set -euo pipefail
 
+# An app launched from Finder/Dock (DropMemo) or a Shortcut inherits the bare GUI
+# PATH (/usr/bin:/bin:/usr/sbin:/sbin), not the shell's, so Homebrew's `speech`
+# and `ffmpeg` and ~/.local/bin's `claude` are invisible and notetaker dies on
+# "required binary 'speech' not found on PATH". Put the usual install dirs first.
+export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH"
+
 # --- locate the repo (this script lives in <repo>/scripts) -------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
