@@ -973,6 +973,21 @@ class TestTranslate(unittest.TestCase):
         with mock.patch.object(N, "llm", return_value="ALREADY_ENGLISH"):
             self.assertIsNone(N.translate_segments(self.SEGS, **self.KW))
 
+    def test_a_memo_that_opens_in_english_is_still_translated(self):
+        # Regression: only the first batch was asked, so a memo whose first
+        # ~1500 words were English skipped the Spanish that followed.
+        opening = " ".join(f"word{i}." for i in range(1600))
+        segs = [N.Segment("Tom", 0, 1, opening),
+                N.Segment("Ana", 2, 3, "Me voy a Sydney.")]
+        def fake(messages, system, **kw):
+            if "Sydney" not in messages[0]["content"]:
+                return "ALREADY_ENGLISH"
+            return self._numbered(lambda t: "I'm going to Sydney."
+                                  if "Sydney" in t else t)(messages, system)
+        with mock.patch.object(N, "llm", side_effect=fake):
+            got = N.translate_segments(segs, **self.KW)
+        self.assertEqual(got, [opening, "I'm going to Sydney."])
+
     def test_a_dropped_line_is_shown_untranslated_not_lost(self):
         with mock.patch.object(N, "llm", return_value="[0] Hi, how are you?"), \
                 redirect_stderr(io.StringIO()) as err:

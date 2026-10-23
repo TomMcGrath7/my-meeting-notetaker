@@ -75,7 +75,7 @@ final class PipelineModel: ObservableObject {
     @Published var denoise = false
     @Published var diarize: DiarizeEngine = .pyannote
     @Published var asrModel: String = "1.7B"          // 0.6B = faster, 1.7B = accurate
-    @Published var language: String = "nl"            // hint for speech ASR (blank = auto)
+    @Published var language: String = ""              // hint for speech ASR (blank = auto, right for a mixed memo)
     @Published var transcriptText: String = ""        // optional: paste a transcript to force-align
     @Published var transcriptURL: URL?                // …or attach one from a file (fallback)
 
