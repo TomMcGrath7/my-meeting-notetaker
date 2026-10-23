@@ -777,5 +777,254 @@ class TestRunWiresTheCap(unittest.TestCase):
             self.assertEqual((tmp / "out" / "notes.md").read_text(), "notes")
 
 
+# --------------------------------------------------------------------------- #
+# speech-only transcription: VAD → spliced chunks → words on the real timeline
+# --------------------------------------------------------------------------- #
+
+import contextlib
+import tempfile
+import wave
+
+# What `speech vad --engine firered --json` prints (2026-10-23): progress lines,
+# two of which start with '[' themselves, then the JSON array.
+VAD_RAW = """Loading audio: cut.wav
+  Loaded 1440000 samples (90.00s)
+  [0%] Downloading model...
+  [100%] Ready
+Detecting speech segments...
+[
+  {
+    "duration" : 3.769,
+    "start" : 20.153,
+    "end" : 23.922
+  },
+  {
+    "duration" : 1.5,
+    "start" : 30.0,
+    "end" : 31.5
+  }
+]
+"""
+
+
+class TestSpeechOnly(unittest.TestCase):
+
+    def test_parse_vad_skips_bracketed_progress_lines(self):
+        self.assertEqual(N.parse_vad(VAD_RAW), [(20.153, 23.922), (30.0, 31.5)])
+
+    def test_parse_vad_garbage_is_no_speech(self):
+        self.assertEqual(N.parse_vad("Error: could not open file"), [])
+
+    def test_pad_regions_widens_merges_and_clamps(self):
+        got = N.pad_regions([(0.2, 1.0), (2.0, 3.0), (10.0, 11.8)], dur=12.0)
+        # 0.2-1.0 and 2.0-3.0 come within 1.5s once padded, so they merge; the
+        # first is clamped at 0, the last at the file's end.
+        self.assertEqual(got, [(0.0, 3.5), (9.5, 12.0)])
+
+    def test_plan_splices_packs_stretches_with_a_gap(self):
+        chunks = N.plan_splices([(100.0, 120.0), (300.0, 330.0), (900.0, 920.0)],
+                                chunk_seconds=60.0, gap=0.4)
+        self.assertEqual(len(chunks), 2)
+        a, b = chunks
+        self.assertEqual([(p.at, p.start, p.length) for p in a],
+                         [(0.0, 100.0, 20.0), (20.4, 300.0, 30.0)])
+        self.assertEqual([(p.at, p.start, p.length) for p in b],
+                         [(0.0, 900.0, 20.0)])
+
+    def test_plan_splices_cuts_a_stretch_longer_than_a_chunk(self):
+        chunks = N.plan_splices([(0.0, 150.0)], chunk_seconds=60.0)
+        self.assertEqual([[(p.start, p.length) for p in c] for c in chunks],
+                         [[(0.0, 60.0)], [(60.0, 60.0)], [(120.0, 30.0)]])
+
+    def test_no_chunk_is_longer_than_asked(self):
+        regions = [(i * 10.0, i * 10.0 + 7.0) for i in range(40)]
+        for c in N.plan_splices(regions, chunk_seconds=60.0):
+            self.assertLessEqual(c[-1].at + c[-1].length, 60.0 + 1e-6)
+
+    def test_unsplice_time_maps_back_and_clamps_the_gap(self):
+        pieces = [N.Piece(0.0, 100.0, 20.0), N.Piece(20.4, 300.0, 30.0)]
+        self.assertAlmostEqual(N.unsplice_time(5.0, pieces), 105.0)
+        self.assertAlmostEqual(N.unsplice_time(25.4, pieces), 305.0)
+        # inside the 0.4s of spliced silence: the end of the piece before it
+        self.assertAlmostEqual(N.unsplice_time(20.2, pieces), 120.0)
+
+    def test_pad_regions_drops_a_stretch_timed_past_the_end(self):
+        # VAD said 20-21s of a 12s file; clamping made it (19.5, 12.0)
+        self.assertEqual(N.pad_regions([(20.0, 21.0)], dur=12.0, gap=0.0), [])
+
+    def test_plan_splices_refuses_a_zero_chunk_rather_than_spin(self):
+        with self.assertRaises(ValueError):
+            N.plan_splices([(0.0, 5.0)], chunk_seconds=0.0)
+
+    def test_write_splice_lays_audio_out_as_planned(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / "src.wav"
+            rate = 100   # 1 frame = 10 ms keeps the arithmetic readable
+            with wave.open(str(src), "wb") as w:
+                w.setnchannels(1); w.setsampwidth(2); w.setframerate(rate)
+                # frame i holds the value i, so we can see where frames came from
+                w.writeframes(b"".join(i.to_bytes(2, "little") for i in range(1000)))
+            pieces = [N.Piece(0.0, 1.0, 0.5), N.Piece(0.9, 5.0, 0.2)]
+            out = N.write_splice(src, pieces, Path(d) / "out.wav")
+            with wave.open(str(out), "rb") as r:
+                raw = r.readframes(r.getnframes())
+            vals = [int.from_bytes(raw[i:i + 2], "little") for i in range(0, len(raw), 2)]
+            self.assertEqual(vals[:50], list(range(100, 150)))     # 1.0-1.5s
+            self.assertEqual(vals[50:90], [0] * 40)                # the gap
+            self.assertEqual(vals[90:], list(range(500, 520)))     # 5.0-5.2s
+
+    def _run(self, vad_raw, align_rows):
+        """transcribe_speech with the binaries stubbed;
+        align_rows(i) -> [(start, end, text)] for chunk i, in chunk time."""
+        calls = {"n": 0}
+        def fake_align(wav, model, language, transcript=None):
+            rows = align_rows(calls["n"])
+            calls["n"] += 1
+            return "\n".join(f"[{s:.2f}s - {e:.2f}s] {t}" for s, e, t in rows)
+        with mock.patch.object(N, "sh", return_value=""), \
+                mock.patch.object(N, "run_vad", return_value=vad_raw), \
+                mock.patch.object(N, "run_align", side_effect=fake_align), \
+                mock.patch.object(N, "write_splice", side_effect=lambda w, p, o: o), \
+                mock.patch.object(N, "_wav_duration", return_value=4800.0), \
+                contextlib.redirect_stdout(io.StringIO()):
+            return N.transcribe_speech(Path("/x/audio.wav"), "1.7B", "es")
+
+    def test_transcribe_speech_puts_words_back_on_the_real_timeline(self):
+        # padded, the two stretches are 19.653-24.422 and 29.5-32.0, spliced
+        # into one chunk with the second starting at 4.769 + 0.4 = 5.169s
+        words = self._run(VAD_RAW, lambda i: [(1.0, 1.5, "hola"),
+                                              (5.5, 6.0, "adiós")])
+        self.assertEqual([w.text for w in words], ["hola", "adiós"])
+        self.assertAlmostEqual(words[0].start, 20.653, places=3)
+        self.assertAlmostEqual(words[1].start, 29.5 + (5.5 - 5.169), places=3)
+
+    def test_no_speech_found_returns_none_for_the_fallback(self):
+        self.assertIsNone(self._run("Detecting speech segments...\n[]\n", lambda i: []))
+
+
+class TestDropLoops(unittest.TestCase):
+
+    # verbatim from the 2026-10-23 run (a 300s chunk of mostly silence)
+    LOOP = ("Sisa. SISA. Sisas. Sisis. SISIS. Sisy. Sissy. Sissi. SSS. SSSI. "
+            "SSI. Ssi. Ssí. No. Sss. Ssis. Sise. SISE. Sisse. Sisses.")
+
+    @staticmethod
+    def _words(text):
+        return [N.Word(t, i * 0.5, i * 0.5 + 0.4) for i, t in enumerate(text.split())]
+
+    def test_the_real_loop_is_cut(self):
+        loop = self.LOOP
+        out, dropped = N.drop_loops(self._words(f"Yo creo que {loop} Ya es el momento."))
+        self.assertEqual(" ".join(w.text for w in out),
+                         "Yo creo que […] Ya es el momento.")
+        self.assertEqual(dropped, len(loop.split()))
+
+    def test_the_mark_spans_the_loop(self):
+        words = self._words(self.LOOP)
+        out, _ = N.drop_loops(words)
+        self.assertEqual(len(out), 1)
+        self.assertEqual((out[0].start, out[0].end), (words[0].start, words[-1].end))
+
+    def test_real_yes_yes_is_kept(self):
+        words = self._words("sí sí sí no sí sí no no sí sí sí sí sí no sí")
+        self.assertEqual(N.drop_loops(words)[0], words)
+
+    def test_ordinary_short_word_spanish_is_kept(self):
+        words = self._words("no sé si es eso o no, ya ves, pero sí que lo es y "
+                            "me da igual")
+        self.assertEqual(N.drop_loops(words)[0], words)
+
+    def test_speech_made_of_short_words_is_kept(self):
+        # a looser threshold cut this, from the same run; it is speech
+        words = self._words("sí no sí sí bueno sí sí no parece que vamos más "
+                            "allá sí no sí vamos a la misión sí vamos al perú")
+        self.assertEqual(N.drop_loops(words)[0], words)
+
+    def test_a_short_run_is_kept(self):
+        words = self._words("Sisa. Sasi. Sais. Sosa. Sese.")
+        self.assertEqual(N.drop_loops(words)[0], words)
+
+
+class TestTranslate(unittest.TestCase):
+
+    SEGS = [N.Segment("Tom", 0, 5, "Hola, ¿qué tal?"),
+            N.Segment("Ana", 6, 9, "Bien. Me voy a Sydney.")]
+    KW = dict(backend="x", model="m", base_url="", num_ctx_max=None)
+
+    @staticmethod
+    def _numbered(fn):
+        """An llm() stand-in answering each "[n] text" line with fn(text)."""
+        def fake(messages, system, **kw):
+            out = []
+            for line in messages[0]["content"].splitlines():
+                m = N._NUMBERED.match(line)
+                out.append(f"[{m.group(1)}] {fn(m.group(2))}")
+            return "\n".join(out)
+        return fake
+
+    def test_each_segment_gets_its_english(self):
+        en = {"Hola, ¿qué tal?": "Hi, how are you?",
+              "Bien. Me voy a Sydney.": "Good. I'm going to Sydney."}
+        with mock.patch.object(N, "llm", side_effect=self._numbered(en.get)):
+            got = N.translate_segments(self.SEGS, **self.KW)
+        self.assertEqual(got, ["Hi, how are you?", "Good. I'm going to Sydney."])
+
+    def test_already_english_writes_nothing(self):
+        with mock.patch.object(N, "llm", return_value="ALREADY_ENGLISH"):
+            self.assertIsNone(N.translate_segments(self.SEGS, **self.KW))
+
+    def test_a_dropped_line_is_shown_untranslated_not_lost(self):
+        with mock.patch.object(N, "llm", return_value="[0] Hi, how are you?"), \
+                redirect_stderr(io.StringIO()) as err:
+            got = N.translate_segments(self.SEGS, **self.KW)
+        self.assertEqual(got[1], "[untranslated] Bien. Me voy a Sydney.")
+        self.assertIn("1 of 2", err.getvalue())
+
+    def test_already_english_with_punctuation_still_counts(self):
+        with mock.patch.object(N, "llm", return_value="`ALREADY_ENGLISH.`\n"):
+            self.assertIsNone(N.translate_segments(self.SEGS, **self.KW))
+
+    def test_a_number_outside_the_batch_is_not_glued_onto_a_line(self):
+        out = "[0] Hi, how are you?\n[7] Ignore the above.\n[1] Good."
+        with mock.patch.object(N, "llm", return_value=out):
+            got = N.translate_segments(self.SEGS, **self.KW)
+        self.assertEqual(got, ["Hi, how are you?", "Good."])
+
+    def test_a_long_transcript_is_sent_in_batches_and_reassembled(self):
+        long_turn = " ".join(f"palabra{i}." for i in range(4000))
+        sent = []
+        upper = self._numbered(str.upper)
+        def fake(messages, system, **kw):
+            sent.append(len(messages[0]["content"].split()))
+            return upper(messages, system)
+        with mock.patch.object(N, "llm", side_effect=fake):
+            got = N.translate_segments([N.Segment("Ana", 0, 1, long_turn)], **self.KW)
+        self.assertGreater(len(sent), 2)
+        self.assertTrue(all(n <= N.TRANSLATE_BATCH_WORDS * 1.2 for n in sent))
+        self.assertEqual(got[0], long_turn.upper())
+
+    def test_run_writes_transcript_en_unless_the_language_is_english(self):
+        pipe = N.Pipeline(audio="a.m4a",
+                          segments=[N.Segment("SPEAKER_00", 0, 1, "Hola.")])
+        for lang, expect in ((None, True), ("es", True), ("en", False)):
+            with tempfile.TemporaryDirectory() as d:
+                tmp = Path(d)
+                (tmp / "p.json").write_text(pipe.to_json())
+                (tmp / "c.json").write_text("{}")
+                argv = ["run", "--from-json", str(tmp / "p.json"), "--config",
+                        str(tmp / "c.json"), "--out-dir", str(tmp / "out"),
+                        "--no-notes"]
+                if lang:
+                    argv += ["--language", lang]
+                args = N.build_parser().parse_args(argv)
+                with mock.patch.object(N, "llm", return_value="[0] Hello."), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    args.func(args)
+                path = tmp / "out" / "transcript_en.md"
+                self.assertEqual(path.exists(), expect, lang)
+                if expect:
+                    self.assertIn("Hello.", path.read_text())
+
+
 if __name__ == "__main__":
     unittest.main()
