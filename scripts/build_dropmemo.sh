@@ -52,6 +52,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>LSMinimumSystemVersion</key>  <string>13.0</string>
   <key>NSPrincipalClass</key>        <string>NSApplication</string>
   <key>NSHighResolutionCapable</key> <true/>
+  <key>NSMicrophoneUsageDescription</key> <string>DropMemo records a short voice note when you press the mic in the context box, and transcribes it on this Mac. Nothing leaves the Mac.</string>
   <key>LSApplicationCategoryType</key> <string>public.app-category.productivity</string>
   <key>DMRepoPath</key>              <string>${REPO}</string>
   <key>CFBundleDocumentTypes</key>

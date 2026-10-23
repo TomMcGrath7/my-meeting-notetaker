@@ -15,6 +15,7 @@ import SwiftUI
 import AppKit
 import Darwin
 import UniformTypeIdentifiers
+import AVFoundation
 
 // MARK: - Where the repo (and thus process.sh + config.yaml) lives
 
@@ -281,10 +282,165 @@ final class PipelineModel: ObservableObject {
     private func appendLine(_ s: String) { log += s + "\n" }
 }
 
+// MARK: - Voice note: say the context instead of typing it
+
+/// The mic in the context box. Records the Mac's microphone to a 16 kHz WAV,
+/// transcribes it on-device with the same `speech` binary and ASR model the
+/// pipeline uses, and hands back the text. macOS Dictation is not involved
+/// (Tom has it off), and nothing leaves the Mac.
+@MainActor
+final class VoiceNote: ObservableObject {
+    enum State { case idle, starting, recording, transcribing }
+    @Published var state: State = .idle
+    @Published var problem: String?
+
+    private var recorder: AVAudioRecorder?
+    private var stopWhenStarted = false   // released before the mic was ready
+    private var onText: ((String) -> Void)?
+    private var model = "1.7B", language = ""
+
+    private var file: URL {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("DropMemo", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("voice-note.wav")
+    }
+
+    func start(model: String, language: String, onText: @escaping (String) -> Void) {
+        guard state == .idle else { return }
+        self.model = model; self.language = language; self.onText = onText
+        state = .starting
+        stopWhenStarted = false
+        problem = nil
+        AVCaptureDevice.requestAccess(for: .audio) { granted in
+            Task { @MainActor in self.begin(granted: granted) }
+        }
+    }
+
+    private func begin(granted: Bool) {
+        guard granted else {
+            state = .idle
+            problem = "Microphone access is off for DropMemo: System Settings → Privacy & Security → Microphone."
+            return
+        }
+        let settings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVSampleRateKey: 16_000,
+            AVNumberOfChannelsKey: 1,
+            AVLinearPCMBitDepthKey: 16,
+            AVLinearPCMIsFloatKey: false,
+            AVLinearPCMIsBigEndianKey: false,
+        ]
+        do {
+            let r = try AVAudioRecorder(url: file, settings: settings)
+            guard r.record() else { throw NSError(domain: "DropMemo", code: 1) }
+            recorder = r
+            state = .recording
+            if stopWhenStarted { stop() }
+        } catch {
+            state = .idle
+            problem = "Couldn't start the microphone: \(error.localizedDescription)"
+        }
+    }
+
+    func stop() {
+        if state == .starting { stopWhenStarted = true; return }
+        guard state == .recording, let r = recorder else { return }
+        r.stop()
+        recorder = nil
+        state = .transcribing
+        let (wav, model, language) = (file, model, language)
+        Task.detached {
+            let result = VoiceNote.transcribe(wav, model: model, language: language)
+            try? FileManager.default.removeItem(at: wav)
+            await MainActor.run {
+                self.state = .idle
+                switch result {
+                case .success(let text) where !text.isEmpty: self.onText?(text)
+                case .success: self.problem = "Didn't catch anything; try again a little closer."
+                case .failure(let e): self.problem = e.message
+                }
+            }
+        }
+    }
+
+    struct Failure: Error { let message: String }
+
+    /// `speech transcribe` prints progress, then "Result: <text>".
+    nonisolated static func transcribe(_ wav: URL, model: String,
+                                       language: String) -> Result<String, Failure> {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        var args = ["speech", "transcribe", wav.path, "--model", model]
+        let lang = language.trimmingCharacters(in: .whitespaces)
+        if !lang.isEmpty { args += ["--language", lang] }
+        proc.arguments = args
+        // A GUI app gets the bare PATH; process.sh does the same for the pipeline.
+        var env = ProcessInfo.processInfo.environment
+        env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + (env["PATH"] ?? "/usr/bin:/bin")
+        proc.environment = env
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = pipe
+        do { try proc.run() } catch {
+            return .failure(Failure(message: "Couldn't run `speech`: \(error.localizedDescription)"))
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
+        let out = String(data: data, encoding: .utf8) ?? ""
+        if let line = out.components(separatedBy: "\n").last(where: { $0.hasPrefix("Result:") }) {
+            return .success(String(line.dropFirst("Result:".count))
+                .trimmingCharacters(in: .whitespaces))
+        }
+        return .failure(Failure(message: "Transcription failed: "
+            + (out.components(separatedBy: "\n").last(where: { !$0.isEmpty }) ?? "no output")))
+    }
+}
+
+/// Click to start and click again to stop, or hold it and talk, letting go to stop.
+struct VoiceNoteButton: View {
+    @ObservedObject var note: VoiceNote
+    let start: () -> Void
+    @State private var pressedAt: Date?
+    @State private var startedThisPress = false
+
+    var body: some View {
+        Group {
+            switch note.state {
+            case .transcribing:
+                ProgressView().controlSize(.small)
+            default:
+                Image(systemName: note.state == .idle ? "mic.fill" : "stop.circle.fill")
+                    .font(.system(size: 15))
+                    .foregroundColor(note.state == .idle ? .secondary : .red)
+            }
+        }
+        .frame(width: 26, height: 26)
+        .contentShape(Rectangle())
+        .gesture(DragGesture(minimumDistance: 0)
+            .onChanged { _ in
+                guard pressedAt == nil else { return }
+                pressedAt = Date()
+                startedThisPress = note.state == .idle
+                if startedThisPress { start() } else { note.stop() }
+            }
+            .onEnded { _ in
+                let held = Date().timeIntervalSince(pressedAt ?? Date())
+                pressedAt = nil
+                if startedThisPress && held > 0.5 { note.stop() }   // hold to talk
+            })
+        .help(note.state == .idle
+              ? "Say the context: click to start and again to stop, or hold while you talk."
+              : "Stop and transcribe")
+        .disabled(note.state == .transcribing)
+    }
+}
+
 // MARK: - View
 
 struct ContentView: View {
     @ObservedObject var m = PipelineModel.shared
+    @StateObject private var voiceNote = VoiceNote()
     @State private var dropHighlight = false
 
     var body: some View {
@@ -340,11 +496,28 @@ struct ContentView: View {
                 .overlay(RoundedRectangle(cornerRadius: 5).stroke(.secondary.opacity(0.3)))
                 .overlay(alignment: .topLeading) {
                     if m.context.isEmpty {
-                        Text("Optional context: roles, who dials in, recurring topics…")
+                        Text("Optional context: roles, who dials in, recurring topics… or use the mic")
                             .font(.caption).foregroundColor(.secondary)
                             .padding(.horizontal, 5).padding(.vertical, 4).allowsHitTesting(false)
                     }
                 }
+                .overlay(alignment: .bottomTrailing) {
+                    VoiceNoteButton(note: voiceNote) {
+                        voiceNote.start(model: m.asrModel, language: m.language) { text in
+                            let ctx = m.context.trimmingCharacters(in: .whitespacesAndNewlines)
+                            m.context = ctx.isEmpty ? text : ctx + " " + text
+                        }
+                    }
+                    .padding(2)
+                }
+            if let problem = voiceNote.problem {
+                Text(problem).font(.caption).foregroundColor(.orange)
+            } else if voiceNote.state == .recording {
+                Text("● Listening… click the mic to stop, or let go if you're holding it.")
+                    .font(.caption).foregroundColor(.red)
+            } else if voiceNote.state == .transcribing {
+                Text("Transcribing on this Mac…").font(.caption).foregroundColor(.secondary)
+            }
         }
         .disabled(m.isRunning)
     }
@@ -402,7 +575,7 @@ struct ContentView: View {
                 .overlay(alignment: .topLeading) {
                     if m.transcriptText.isEmpty {
                         Text(m.transcriptURL.map { "Using file: \($0.lastPathComponent)" }
-                             ?? "Paste here for better text (especially non-English); leave empty to let speech transcribe.")
+                             ?? "Leave empty to transcribe the memo. Only paste a transcript in the memo's own language.")
                             .font(.caption).foregroundColor(.secondary)
                             .padding(.horizontal, 5).padding(.vertical, 4).allowsHitTesting(false)
                     }
