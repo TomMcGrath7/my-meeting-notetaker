@@ -1095,6 +1095,9 @@ merge, skip or comment. Keep fillers short ("mm", "yeah"). Where the source is
 garbled and you cannot tell what was said, write [unclear] for that part rather
 than guessing. Keep names as they are. Leave {LOOP_MARK} as it is.
 
+Memos often mix languages ("¿Tienes pizza? No, I already had the pizza."): a line
+or part of a line that is already English is copied unchanged.
+
 If EVERY line is already in English, output only the word ALREADY_ENGLISH."""
 
 TRANSLATE_PIECE_WORDS = 120     # a long turn is translated in pieces this size
@@ -1118,7 +1121,9 @@ def _split_turn(text: str, limit: int = TRANSLATE_PIECE_WORDS) -> list[str]:
 
 def translate_segments(segs: list[Segment], **llm_kw) -> list[str] | None:
     """English text for each segment, or None when the transcript is already
-    English (the model says so on the first batch)."""
+    English. Each batch is asked on its own: a memo that opens in English and
+    turns to Spanish must still be translated, so one English batch keeps its
+    own lines as they are and only an all-English answer skips the file."""
     pieces: list[tuple[int, str]] = [(i, p) for i, s in enumerate(segs)
                                      for p in _split_turn(s.text)]
     batches: list[list[int]] = [[]]
@@ -1131,12 +1136,15 @@ def translate_segments(segs: list[Segment], **llm_kw) -> list[str] | None:
         batches[-1].append(k)
         count += n
     english: dict[int, str] = {}
-    for b, batch in enumerate(batches):
+    english_batches = 0
+    for batch in batches:
         user = "\n".join(f"[{k}] {pieces[k][1]}" for k in batch)
         out = llm([{"role": "user", "content": user}], TRANSLATE_SYSTEM,
                   max_tokens=8000, **llm_kw)
-        if b == 0 and out.strip().strip("`*.\"' ").upper() == ALREADY_ENGLISH:
-            return None
+        if out.strip().strip("`*.\"' ").upper() == ALREADY_ENGLISH:
+            english_batches += 1
+            english.update((k, pieces[k][1]) for k in batch)
+            continue
         last = None
         for line in out.splitlines():
             m = _NUMBERED.match(line)
@@ -1148,6 +1156,8 @@ def translate_segments(segs: list[Segment], **llm_kw) -> list[str] | None:
                     english[last] = m.group(2).strip()
             elif last is not None and line.strip():
                 english[last] += " " + line.strip()   # a wrapped line
+    if english_batches == len(batches):
+        return None
     missing = [k for k in range(len(pieces)) if k not in english]
     if missing:
         print(f"warning: {len(missing)} of {len(pieces)} transcript lines came back "
