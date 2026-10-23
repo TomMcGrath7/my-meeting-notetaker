@@ -7,12 +7,14 @@ Pipeline (each stage runs alone, so peak RAM ~= the single biggest model):
     audio.m4a
       └─ (optional) speech denoise          -> clean.wav
       └─ speech diarize --json              -> who spoke when   (turns)
-      └─ speech align                       -> word timestamps  (words)
+      └─ speech vad                         -> where the speech is
+      └─ speech align, speech only          -> word timestamps  (words)
       └─ bucket words into turns            -> speaker segments  [local]
       └─ LLM: map SPEAKER_xx -> real names, flag low-confidence  [text only]
+      └─ LLM: English transcript, if the memo isn't English      [text only]
       └─ LLM: meeting notes (summary / decisions / actions)      [text only]
 
-Only TEXT ever leaves the device (the two LLM steps). Audio + diarization +
+Only TEXT ever leaves the device (the LLM steps). Audio + diarization +
 ASR are 100% local via the `speech` binary (github.com/soniqo/speech-swift).
 Point --llm-backend at a local model (ollama, or openai for any other
 OpenAI-compatible server) to keep it ALL local.
@@ -331,6 +333,233 @@ def parse_align(raw: str) -> list[Word]:
             end=float(_first(w, "end", "endTime", "end_time", default=0.0)),
         ))
     return words
+
+# --------------------------------------------------------------------------- #
+# stage 3a — speech-only transcription  (speech vad, then align per chunk)
+# --------------------------------------------------------------------------- #
+
+# Qwen3-ASR derails on long silence. Measured on an 80-min Spanish phone call
+# (2026-10-23) where only one side was audible: a 300s chunk that was mostly
+# silence came back as "Sisa. SISA. Sasi. Sesses…" loops, and the last chunk as
+# an invented textbook dialogue about a market crash. The SAME audio cut to 90s
+# transcribed cleanly, and the real speech the loop had swallowed came back.
+# So by default we find the speech first, splice just the speech into chunks of
+# ~VAD_CHUNK_SECONDS (short silence between pieces), transcribe those, and map
+# every word back onto the real timeline. Silence never reaches the model.
+#
+# VAD engine: firered is ~7s on 80 min; pyannote took ~10 min for the same file.
+# firered alone found 1 min of speech in that (very quiet, ~-60 dB) recording;
+# after loudness normalisation it found ~20 min, and padded as below it covered
+# 95% of what pyannote found. The normalised copy is for detection only; the
+# ASR hears the original audio (normalising did not make its text better).
+VAD_CHUNK_SECONDS = 60.0
+VAD_PAD = 0.5           # seconds kept either side of each detected stretch
+VAD_MERGE_GAP = 1.5     # stretches closer than this are one stretch
+SPLICE_GAP = 0.4        # silence put between spliced stretches in a chunk
+VAD_NORMALISE = "dynaudnorm=f=250:g=15:m=30"
+
+def run_vad(wav: Path) -> str:
+    return sh(["speech", "vad", str(wav), "--engine", "firered", "--json"])
+
+def parse_vad(raw: str) -> list[tuple[float, float]]:
+    """`speech vad --json` → [(start, end)]. The progress lines before the JSON
+    ("[0%] Downloading…") start with '[' too; _extract_json skips them."""
+    try:
+        data = _extract_json(raw)
+    except json.JSONDecodeError:
+        return []
+    if isinstance(data, dict):
+        data = _first(data, "segments", "speech", "results", default=[])
+    out = []
+    for item in data:
+        s = float(_first(item, "start", "startTime", "start_time", default=0.0))
+        e = float(_first(item, "end", "endTime", "end_time", default=s))
+        if e > s:
+            out.append((s, e))
+    return sorted(out)
+
+def pad_regions(regions: list[tuple[float, float]], dur: float,
+                pad: float = VAD_PAD,
+                gap: float = VAD_MERGE_GAP) -> list[tuple[float, float]]:
+    """Widen each stretch by `pad` (VAD clips word edges on quiet audio) and
+    merge stretches that end up closer than `gap`."""
+    out: list[tuple[float, float]] = []
+    for s, e in sorted(regions):
+        s, e = max(0.0, s - pad), min(dur, e + pad)
+        if e <= s:      # VAD timed it past the end of the audio
+            continue
+        if out and s - out[-1][1] < gap:
+            out[-1] = (out[-1][0], max(out[-1][1], e))
+        else:
+            out.append((s, e))
+    return out
+
+@dataclass
+class Piece:
+    """One stretch of real audio inside a spliced chunk."""
+    at: float          # where it starts in the chunk
+    start: float       # where it starts in the recording
+    length: float
+
+def plan_splices(regions: list[tuple[float, float]],
+                 chunk_seconds: float = VAD_CHUNK_SECONDS,
+                 gap: float = SPLICE_GAP) -> list[list[Piece]]:
+    """Pack speech stretches into chunks of at most ~chunk_seconds of audio.
+    A stretch longer than a chunk is cut into chunk-sized pieces."""
+    if chunk_seconds <= 0:
+        raise ValueError(f"chunk_seconds must be positive, got {chunk_seconds}")
+    chunks: list[list[Piece]] = []
+    cur: list[Piece] = []
+    used = 0.0
+    for s, e in regions:
+        while e - s > 1e-6:
+            length = min(e - s, chunk_seconds)
+            need = length + (gap if cur else 0.0)
+            if cur and used + need > chunk_seconds:
+                chunks.append(cur)
+                cur, used, need = [], 0.0, length
+            cur.append(Piece(at=used + (need - length), start=s, length=length))
+            used += need
+            s += length
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+def write_splice(wav: Path, pieces: list[Piece], out: Path) -> Path:
+    """Write the pieces of `wav` back to back, `SPLICE_GAP`-ish silence between
+    (exactly as laid out by plan_splices). Same format as the source."""
+    with wave.open(str(wav), "rb") as src, wave.open(str(out), "wb") as dst:
+        dst.setparams(src.getparams())
+        rate, width, ch = src.getframerate(), src.getsampwidth(), src.getnchannels()
+        written = 0
+        for p in pieces:
+            pad = int(round(p.at * rate)) - written
+            if pad > 0:
+                dst.writeframes(b"\x00" * pad * width * ch)
+                written += pad
+            src.setpos(min(int(round(p.start * rate)), src.getnframes()))
+            frames = src.readframes(int(round(p.length * rate)))
+            dst.writeframes(frames)
+            written += len(frames) // (width * ch)
+    return out
+
+def unsplice_time(t: float, pieces: list[Piece]) -> float:
+    """Chunk time → recording time. A time in the silence between two pieces
+    belongs to the piece before it (clamped to that piece's end)."""
+    best = pieces[0]
+    for p in pieces:
+        if p.at <= t:
+            best = p
+        else:
+            break
+    return best.start + min(max(t - best.at, 0.0), best.length)
+
+def transcribe_speech(wav: Path, model: str, language: str | None,
+                      chunk_seconds: float = VAD_CHUNK_SECONDS,
+                      progress=None) -> list[Word] | None:
+    """Transcribe only the speech in `wav`. Returns None when the VAD finds no
+    speech at all, so the caller can fall back to plain chunking rather than
+    return an empty transcript for a recording that is merely very quiet."""
+    dur = _wav_duration(wav)
+    norm = wav.parent / "_vad_norm.wav"
+    try:
+        sh(["ffmpeg", "-y", "-i", str(wav), "-af", VAD_NORMALISE,
+            "-ac", "1", "-ar", "16000", "-f", "wav", str(norm)], capture=True)
+        regions = pad_regions(parse_vad(run_vad(norm)), dur)
+    finally:
+        try:
+            norm.unlink()
+        except OSError:
+            pass
+    if not regions:
+        return None
+    chunks = plan_splices(regions, chunk_seconds)
+    speech = sum(e - s for s, e in regions)
+    print(f"  speech: {speech/60:.1f} of {dur/60:.0f} min "
+          f"→ {len(chunks)} chunks of ≤{chunk_seconds:.0f}s")
+    words: list[Word] = []
+    tmp = wav.parent / "_speech_chunk.wav"
+    try:
+        for i, pieces in enumerate(chunks):
+            write_splice(wav, pieces, tmp)
+            for w in parse_align(run_align(tmp, model, language)):
+                mid = (w.start + w.end) / 2.0
+                start = unsplice_time(w.start, pieces)
+                end = unsplice_time(w.end, pieces)
+                if end < start:   # a word straddling a splice: keep it where its middle is
+                    start = end = unsplice_time(mid, pieces)
+                words.append(Word(text=w.text, start=start, end=end))
+            if progress:
+                progress(i + 1, len(chunks), len(words))
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+    return words
+
+# A backstop for the loops that still get through: a long run of short words
+# made of a handful of letters, most of them different ("Sisa. SISA. Sasi.
+# Sesses. Sosa."). Real speech repeats a WORD ("sí, sí, sí, no, sí"), which
+# has few distinct words and is kept; a loop mutates, which has many.
+#
+# Tuned on that run's 2,828 words: these cut the 202-word loop and nothing else.
+# Looser (12 words, 5 distinct) also cut "sí vamos a la misión sí vamos al",
+# which is speech. Runs of "mhm hmm" are left alone; they are cheap to read.
+LOOP_MIN_RUN = 20
+LOOP_MAX_WORD = 6       # letters, after stripping accents and punctuation
+LOOP_MAX_LETTERS = 8    # distinct letters across the whole run
+LOOP_MIN_DISTINCT = 8   # distinct words across the whole run
+LOOP_CORE = 0.6         # a loop's core letters are in this share of its words
+LOOP_MARK = "[…]"
+
+def _bare(word: str) -> str:
+    import unicodedata
+    s = unicodedata.normalize("NFKD", word.lower())
+    return "".join(c for c in s if c.isalpha())
+
+def _trim_loop(run: list[Word]) -> tuple[int, int]:
+    """Give back the real words at either edge of a candidate loop ("… Sisses.
+    Ya es el momento"): an edge word missing one of the loop's core letters
+    is not part of it. Returns the [lo, hi) slice that is the loop."""
+    if not run:
+        return 0, 0
+    bares = [set(_bare(w.text)) for w in run]
+    core = {c for c in set().union(*bares)
+            if sum(c in b for b in bares) >= LOOP_CORE * len(run)}
+    lo, hi = 0, len(run)
+    while lo < hi and not core <= bares[lo]:
+        lo += 1
+    while hi > lo and not core <= bares[hi - 1]:
+        hi -= 1
+    return lo, hi
+
+def drop_loops(words: list[Word]) -> tuple[list[Word], int]:
+    """Replace each decoder loop with one LOOP_MARK word. Returns (words, how
+    many words were dropped)."""
+    out: list[Word] = []
+    dropped = 0
+    i, n = 0, len(words)
+    while i < n:
+        j, letters = i, set()
+        while j < n:
+            b = _bare(words[j].text)
+            if len(b) > LOOP_MAX_WORD or len(letters | set(b)) > LOOP_MAX_LETTERS:
+                break
+            letters |= set(b)
+            j += 1
+        lo, hi = _trim_loop(words[i:j])
+        run = words[i + lo:i + hi]
+        if (len(run) >= LOOP_MIN_RUN
+                and len({_bare(w.text) for w in run}) >= LOOP_MIN_DISTINCT):
+            out.extend(words[i:i + lo])     # real words the trim gave back
+            out.append(Word(LOOP_MARK, run[0].start, run[-1].end))
+            dropped += len(run)
+            i += hi
+        else:
+            out.append(words[i])
+            i += 1
+    return out, dropped
 
 # --------------------------------------------------------------------------- #
 # stage 4 — merge words into speaker turns  (local, no model)
@@ -852,6 +1081,84 @@ def make_notes(segs: list[Segment], context: str, **llm_kw) -> str:
     return llm([{"role": "user", "content": user}], NOTES_SYSTEM,
                max_tokens=4000, **llm_kw)
 
+# A full English transcript of a memo in another language. Notes alone were not
+# enough: the transcript itself is what gets quoted and searched later, and a
+# translation pasted into a chat app summarised two-thirds of a call away
+# ("[The conversation continues…]"). So: numbered lines in, the same numbered
+# lines out, in batches, and a line that comes back missing is shown untranslated
+# rather than silently lost.
+TRANSLATE_SYSTEM = f"""You translate a speech-to-text transcript into English.
+
+Each input line is "[n] text". Output exactly one line per input line, "[n] English
+translation", same numbers, same order. Translate everything; never summarise,
+merge, skip or comment. Keep fillers short ("mm", "yeah"). Where the source is
+garbled and you cannot tell what was said, write [unclear] for that part rather
+than guessing. Keep names as they are. Leave {LOOP_MARK} as it is.
+
+If EVERY line is already in English, output only the word ALREADY_ENGLISH."""
+
+TRANSLATE_PIECE_WORDS = 120     # a long turn is translated in pieces this size
+TRANSLATE_BATCH_WORDS = 1500    # words per LLM call
+ALREADY_ENGLISH = "ALREADY_ENGLISH"
+_NUMBERED = re.compile(r"^\s*\[(\d+)\]\s?(.*)$")
+
+def _split_turn(text: str, limit: int = TRANSLATE_PIECE_WORDS) -> list[str]:
+    """Cut a turn into pieces of about `limit` words, at a sentence end when
+    there is one in the second half of the piece."""
+    words = text.split()
+    pieces, cur = [], []
+    for w in words:
+        cur.append(w)
+        if len(cur) >= limit or (len(cur) >= limit // 2 and _SENTENCE_END.search(w)):
+            pieces.append(" ".join(cur))
+            cur = []
+    if cur:
+        pieces.append(" ".join(cur))
+    return pieces or [""]
+
+def translate_segments(segs: list[Segment], **llm_kw) -> list[str] | None:
+    """English text for each segment, or None when the transcript is already
+    English (the model says so on the first batch)."""
+    pieces: list[tuple[int, str]] = [(i, p) for i, s in enumerate(segs)
+                                     for p in _split_turn(s.text)]
+    batches: list[list[int]] = [[]]
+    count = 0
+    for k, (_, text) in enumerate(pieces):
+        n = len(text.split())
+        if batches[-1] and count + n > TRANSLATE_BATCH_WORDS:
+            batches.append([])
+            count = 0
+        batches[-1].append(k)
+        count += n
+    english: dict[int, str] = {}
+    for b, batch in enumerate(batches):
+        user = "\n".join(f"[{k}] {pieces[k][1]}" for k in batch)
+        out = llm([{"role": "user", "content": user}], TRANSLATE_SYSTEM,
+                  max_tokens=8000, **llm_kw)
+        if b == 0 and out.strip().strip("`*.\"' ").upper() == ALREADY_ENGLISH:
+            return None
+        last = None
+        for line in out.splitlines():
+            m = _NUMBERED.match(line)
+            if m:
+                # a number that is not in this batch is the model's invention,
+                # not a wrapped line of the one before it
+                last = int(m.group(1)) if int(m.group(1)) in batch else None
+                if last is not None:
+                    english[last] = m.group(2).strip()
+            elif last is not None and line.strip():
+                english[last] += " " + line.strip()   # a wrapped line
+    missing = [k for k in range(len(pieces)) if k not in english]
+    if missing:
+        print(f"warning: {len(missing)} of {len(pieces)} transcript lines came back "
+              f"untranslated; they are shown in the original language.",
+              file=sys.stderr)
+    out_texts = [""] * len(segs)
+    for k, (i, text) in enumerate(pieces):
+        part = english.get(k, f"[untranslated] {text}")
+        out_texts[i] = f"{out_texts[i]} {part}".strip()
+    return out_texts
+
 # --------------------------------------------------------------------------- #
 # rendering
 # --------------------------------------------------------------------------- #
@@ -867,6 +1174,12 @@ def render_named(segs: list[Segment]) -> str:
         mark = "  ⚠️ uncertain" if s.flagged else ""
         out.append(f"**{s.speaker}** ({hhmmss(s.start)}){mark}\n{s.text}\n")
     return "\n".join(out)
+
+def render_english(segs: list[Segment], english: list[str]) -> str:
+    head = ("_English translation of transcript_named.md, made by an LLM from the "
+            "speech-to-text. [unclear] marks what could not be made out; the "
+            "original is the reference._\n\n")
+    return head + render_named([replace(s, text=t) for s, t in zip(segs, english)])
 
 # --------------------------------------------------------------------------- #
 # commands
@@ -964,22 +1277,40 @@ def cmd_run(args):
         align_chunk = args.align_chunk or (
             ALIGN_CHUNK_SECONDS_FORCED if transcript_text else ALIGN_CHUNK_SECONDS)
         dur = _wav_duration(wav)
-        if dur > align_chunk + 1.0:
+        fixed_chunks = bool(transcript_text) or args.no_vad
+        if fixed_chunks and dur > align_chunk + 1.0:
             n = int(dur // align_chunk) + (1 if dur % align_chunk else 0)
             mode = "forced-align" if transcript_text else "transcribe"
             print(f"• aligning words… ({dur/60:.0f} min → {n} chunks, "
                   f"{align_chunk:.0f}s, {mode})")
-        else:
+        elif fixed_chunks:
             print("• aligning words…")
-        try:
-            words = align_words(wav, args.model, args.language,
-                                transcript=transcript_text,
-                                chunk_seconds=align_chunk,
-                                strict=args.strict,
-                                progress=lambda i, n, t: print(f"  chunk {i}/{n} … {t} words"))
-        except AlignmentCollapse as e:
-            sys.exit(f"error: {e}. Re-run with a smaller --align-chunk, or drop "
-                     f"--strict to accept the unreliable timestamps.")
+        progress = lambda i, n, t: print(f"  chunk {i}/{n} … {t} words")
+        words = None
+        # Speech-only is the default when transcribing. A provided transcript
+        # is split across chunks by duration, which only holds on the plain
+        # timeline, so --transcript (and --no-vad) keep the fixed chunks.
+        if not fixed_chunks:
+            print("• finding speech…")
+            words = transcribe_speech(wav, args.model, args.language,
+                                      chunk_seconds=args.vad_chunk,
+                                      progress=progress)
+            if words is None:
+                print("  no speech found by the VAD; transcribing the whole file")
+        if words is None:
+            try:
+                words = align_words(wav, args.model, args.language,
+                                    transcript=transcript_text,
+                                    chunk_seconds=align_chunk,
+                                    strict=args.strict,
+                                    progress=progress)
+            except AlignmentCollapse as e:
+                sys.exit(f"error: {e}. Re-run with a smaller --align-chunk, or drop "
+                         f"--strict to accept the unreliable timestamps.")
+        if not transcript_text:
+            words, dropped = drop_loops(words)
+            if dropped:
+                print(f"  dropped {dropped} words of decoder loop (marked {LOOP_MARK})")
         print(f"  {len(words)} words")
         if not turns or not words:
             sys.exit("error: diarization or alignment produced nothing. "
@@ -1020,6 +1351,16 @@ def cmd_run(args):
     (out_dir / "transcript_named.md").write_text(render_named(pipe.segments))
     (out_dir / "pipeline.json").write_text(pipe.to_json())
 
+    english = None
+    if not args.no_translate and not (args.language or "").lower().startswith("en"):
+        print("• translating the transcript to English via LLM…")
+        english = translate_segments(pipe.segments, **llm_kw)
+        if english is None:
+            print("  already English; no translation written")
+        else:
+            (out_dir / "transcript_en.md").write_text(
+                render_english(pipe.segments, english))
+
     if not args.no_notes:
         print("• writing notes via LLM…")
         notes = make_notes(pipe.segments, context, **llm_kw)
@@ -1027,6 +1368,8 @@ def cmd_run(args):
 
     print(f"\n✓ done → {out_dir}/")
     print("  transcript_named.md   speaker-attributed transcript")
+    if english is not None:
+        print("  transcript_en.md      the same transcript in English")
     print("  pipeline.json         all intermediates (reuse with --from-json)")
     if not args.no_notes:
         print("  notes.md              summary / decisions / action items")
@@ -1080,6 +1423,17 @@ def build_parser() -> argparse.ArgumentParser:
                         f"the forced aligner overloads on longer chunks). speech "
                         f"align only handles a few minutes per call, so long files "
                         f"are chunked + stitched.")
+    r.add_argument("--no-vad", action="store_true",
+                   help="transcribe the whole file in fixed --align-chunk windows, "
+                        "silence included (the old behaviour). By default only "
+                        "the speech is transcribed, since long silence makes the "
+                        "ASR loop or invent text.")
+    r.add_argument("--vad-chunk", type=float, default=VAD_CHUNK_SECONDS,
+                   help=f"seconds of speech per ASR call when transcribing speech "
+                        f"only (default {int(VAD_CHUNK_SECONDS)})")
+    r.add_argument("--no-translate", action="store_true",
+                   help="skip transcript_en.md, the English translation written "
+                        "when the memo is not in English")
     r.add_argument("--strict", action="store_true",
                    help="fail the run (non-zero exit) if any alignment chunk "
                         "collapses, instead of emitting a warning and continuing")

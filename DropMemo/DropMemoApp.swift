@@ -387,7 +387,7 @@ struct ContentView: View {
     private var transcriptRow: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
-                Text("Transcript (optional — paste a Voice Memos export to force-align)")
+                Text("Transcript (optional, and only in the memo's own language; leave empty to transcribe)")
                     .font(.caption).foregroundColor(.secondary)
                 Spacer()
                 Button("Attach file…") { pickTranscript() }

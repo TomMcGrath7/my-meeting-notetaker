@@ -20,9 +20,11 @@ audio.m4a
   ├─ ffmpeg            → 16 kHz mono wav
   ├─ speech denoise    → clean.wav            (optional, good for calls)
   ├─ speech diarize    → who spoke when        (turns)
-  ├─ speech align      → word-level timestamps (words)
+  ├─ speech vad        → where the speech is   (silence is never transcribed)
+  ├─ speech align      → word-level timestamps (words), ~60s of speech a call
   ├─ bucket            → speaker segments       [local, no model]
   ├─ LLM relabel       → SPEAKER_00 → "Tom", flag low-confidence  [text only]
+  ├─ LLM translate     → English transcript, if the memo isn't English [text only]
   └─ LLM notes         → summary / decisions / actions            [text only]
 ```
 
@@ -142,10 +144,21 @@ notetaker works around this automatically: it slices the audio into
 `--align-chunk` windows, aligns each, and stitches the timestamps back together.
 You don't have to do anything; just know an hour-long file means several passes.
 
-The safe window differs by mode, so the default is adaptive:
+**Transcribing (the default) only sends the speech.** `speech vad` finds where
+people are talking (on a loudness-normalised copy, so a quiet phone call is
+still heard), and the speech is spliced into chunks of about 60 seconds
+(`--vad-chunk`) with short pauses between, then every word is mapped back to
+its real time in the recording. Silence never reaches the ASR, because long
+silence is what breaks it: on an 80-minute, one-sided Spanish call, 5-minute
+chunks that were mostly silence came back as hundreds of "Sisa. SISA. Sasi…"
+and an invented dialogue about a market crash, while the same audio in short
+chunks came back as what was said. A filter then replaces any decoder loop
+that still gets through with `[…]`.
 
-- **transcribing** (no transcript): **300s** — the ASR times its own words and
-  stays coherent across a 5-minute chunk.
+`--no-vad` goes back to fixed windows over the whole file. Those windows, and
+the ones a provided transcript uses, differ by mode:
+
+- **transcribing** with `--no-vad`: **300s**.
 - **force-aligning** (`--transcript`): **120s** — the forced aligner overloads on
   longer chunks (feeding it ~700 words / 300s makes it dump the whole chunk into
   the first ~140s), so it needs a tighter window.
@@ -172,6 +185,7 @@ python3 notetaker.py run meeting.m4a --transcript voice-memo.txt
 | file | what |
 |---|---|
 | `transcript_named.md` | speaker-attributed transcript; `⚠️ uncertain` marks flagged turns |
+| `transcript_en.md` | the same transcript in English, when the memo is in another language (`--no-translate` to skip; nothing is written for an English memo or `--language en`) |
 | `notes.md` | summary, key decisions, action items, open questions |
 | `pipeline.json` | every intermediate — re-run the LLM steps without re-processing audio |
 
@@ -351,8 +365,11 @@ Append `--llm-backend openai` to force the older call.
 picker), set **who's in the meeting** (the participants + context fields write
 straight to `config.yaml`, and are pre-filled from it on launch), pick the
 backend / LLM model / denoise / diarize-engine / **ASR size** / **language**,
-optionally **attach a transcript** (a Voice Memos export → force-aligned for
-much better text, especially non-English), watch the pipeline stream live, and
+optionally **attach a transcript** (a Voice Memos export, force-aligned to
+the audio; only one in the memo's own language, since Voice Memos may give an
+English transcript of a Dutch or Spanish memo, and aligning that to the audio
+puts English words on the wrong speech. Leave it empty and the memo is
+transcribed, with `transcript_en.md` written for you), watch the pipeline stream live, and
 **Stop** (⌘.) any time. On completion it reveals the out-dir and opens
 `notes.md`. Build it without Xcode:
 
