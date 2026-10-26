@@ -172,6 +172,10 @@ a `⚠️ … collapsed` warning to stderr; add `--strict` to make that a hard f
 > records the root cause and, importantly, the plausible-but-wrong fixes we
 > already ruled out, so they don't get retried.
 
+> Recorded the same meeting on two devices? [`docs/two-recordings.md`](docs/two-recordings.md)
+> is how two recordings were aligned and merged by hand, and the traps (`--context` leaking
+> into the transcript, ASR on un-normalised quiet audio).
+
 If you already have a transcript (e.g. exported from Voice Memos), hand it over
 and notetaker **force-aligns** it instead of transcribing — better text, and it
 skips ASR entirely:
