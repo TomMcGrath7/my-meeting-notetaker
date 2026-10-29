@@ -167,6 +167,20 @@ Pass `--align-chunk N` to override. If a chunk still collapses, notetaker prints
 a `⚠️ … collapsed` warning to stderr; add `--strict` to make that a hard failure
 (non-zero exit) instead of continuing with unreliable timestamps.
 
+A provided transcript is untimed, so it is first split across chunks by word
+count. Where a chunk got more text than its audio holds, the aligner crushes the
+excess into a tail of zero-length words; a second pass moves that tail into the
+next chunk's text and re-aligns just those two chunks, at most twice
+(`--realign-passes N`, `0` turns it off; chunks already covering 90% of their
+window are left alone). `--align-report` prints, per chunk, the word count, the
+share of words under 0.05s and the window coverage, before and after that pass.
+For a run you already have, `align-report` reads its `pipeline.json` (give the
+chunk size it was aligned with):
+
+```bash
+python3 notetaker.py align-report out-20260702-001651/pipeline.json --align-chunk 300
+```
+
 > Debugging bad speaker cuts or timestamps? Read
 > [`docs/transcript-cut-quality.md`](docs/transcript-cut-quality.md) first — it
 > records the root cause and, importantly, the plausible-but-wrong fixes we

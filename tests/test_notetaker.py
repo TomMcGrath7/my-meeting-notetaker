@@ -12,6 +12,10 @@ guard the timestamp-collapse bug:
   - merge / _turn_for                           : word→speaker attribution.
   - align_words                                 : chunk stitching, proportional
     text split, and the collapse guard / --strict behaviour.
+  - align_words second pass / collapsed_tail    : a crushed tail moves to the
+    next chunk's text and only those two chunks are re-aligned (plan 321).
+  - align_report / chunks_from_words            : the near-zero share and
+    coverage, checked by hand against the captured fixture.
   - llm (openai backend)                        : a prompt the server clipped to
     its context window must fail loudly, not come back as partial notes.
   - llm (ollama backend)                        : the context window is sized to
@@ -283,6 +287,220 @@ class TestAlignWords(unittest.TestCase):
         err = io.StringIO()
         with redirect_stderr(err), self.assertRaises(N.AlignmentCollapse):
             N.align_words(Path("x.wav"), "1.7B", "en", chunk_seconds=100, strict=True)
+
+
+class TestRealignPass(unittest.TestCase):
+    """Plan 321: after pass one, a chunk whose tail collapsed (words crushed at
+    one timestamp) hands those words to the next chunk's text, and only the two
+    chunks involved are aligned again, at most REALIGN_PASSES times."""
+
+    TEXT = " ".join(f"w{i}" for i in range(60))   # 3 chunks of 100s, 20 words each
+
+    def setUp(self):
+        self._orig = (N._wav_duration, N._cut_wav, N.run_align)
+
+    def tearDown(self):
+        N._wav_duration, N._cut_wav, N.run_align = self._orig
+
+    def _install(self, per_chunk, dur=300):
+        """per_chunk(chunk_start, words) -> list[(start, end, text)], local time.
+        Records (chunk_start, words sent) for every aligner call."""
+        self.calls = []
+        cur = {}
+        N._wav_duration = lambda wav: dur
+        def fake_cut(wav, start, length, out):
+            cur["start"] = start
+            return out
+        N._cut_wav = fake_cut
+        def fake_run_align(wav, model, language, transcript=None):
+            ws = (transcript or "").split()
+            self.calls.append((cur["start"], ws))
+            return "\n".join(f"[{s:.2f}s - {e:.2f}s] {t}"
+                             for s, e, t in per_chunk(cur["start"], ws))
+        N.run_align = fake_run_align
+
+    @staticmethod
+    def _spread(ws, until=95.0):
+        """Healthy alignment: 0.5s words evenly spread, the last ending at
+        `until` (95s of a 100s window is 95% coverage)."""
+        step = (until - 0.5) / max(1, len(ws) - 1)
+        return [(i * step, i * step + 0.5, w) for i, w in enumerate(ws)]
+
+    def _align(self, **kw):
+        out = io.StringIO()
+        with redirect_stderr(io.StringIO()), mock.patch("sys.stdout", out):
+            words = N.align_words(Path("x.wav"), "1.7B", "en", transcript=self.TEXT,
+                                  chunk_seconds=100, **kw)
+        return words, out.getvalue()
+
+    def test_crushed_tail_moves_to_next_chunk_and_only_two_chunks_rerun(self):
+        def per_chunk(start, ws):
+            if start == 0 and len(ws) == 20:
+                # ten timed words over 50s, the last ten all at 50.0: collapsed
+                return ([(i * 5.0, i * 5.0 + 0.5, w) for i, w in enumerate(ws[:10])]
+                        + [(50.0, 50.0, w) for w in ws[10:]])
+            return self._spread(ws)     # chunk 3 (and any re-run) covers 95%
+        self._install(per_chunk)
+        words, out = self._align()
+        self.assertEqual([c[0] for c in self.calls], [0, 100, 200, 0, 100])
+        self.assertEqual(self.calls[3][1], [f"w{i}" for i in range(10)])
+        self.assertEqual(self.calls[4][1], [f"w{i}" for i in range(10, 40)])
+        self.assertEqual([w.text for w in words], self.TEXT.split())
+        self.assertFalse([w for w in words if w.end - w.start < 0.05])
+        self.assertIn("re-aligning chunks 1, 2", out)
+
+    def test_two_passes_maximum_then_the_result_stands(self):
+        def per_chunk(start, ws):
+            if start == 0:     # chunk 1 always crushes its last five words at 40s
+                return ([(i * 2.0, i * 2.0 + 0.5, w) for i, w in enumerate(ws[:-5])]
+                        + [(40.0, 40.0, w) for w in ws[-5:]])
+            return self._spread(ws)
+        self._install(per_chunk)
+        trace = {}
+        words, _ = self._align(trace=trace)
+        self.assertEqual([c[0] for c in self.calls], [0, 100, 200, 0, 100, 0, 100])
+        self.assertEqual(len(trace["passes"]), N.REALIGN_PASSES)
+        self.assertEqual(len(self.calls[-2][1]), 10)       # 20 -> 15 -> 10 words
+        crushed = [w for w in words if w.end - w.start < 0.05]
+        self.assertEqual(len(crushed), 5)                   # still crushed: stands
+        self.assertEqual(len(words), 60)
+
+    def test_healthy_run_is_aligned_once(self):
+        self._install(lambda start, ws: self._spread(ws))
+        trace = {}
+        self._align(trace=trace)
+        self.assertEqual(len(self.calls), 3)
+        self.assertEqual(trace["passes"], [])
+
+    def test_well_covered_chunk_is_left_alone_even_with_a_crushed_tail(self):
+        def per_chunk(start, ws):
+            if start == 0:     # covers 95% of the window, tail crushed at 94s
+                return ([(i * 5.0, i * 5.0 + 0.5, w) for i, w in enumerate(ws[:-5])]
+                        + [(95.0, 95.0, w) for w in ws[-5:]])
+            return self._spread(ws)
+        self._install(per_chunk)
+        self._align()
+        self.assertEqual(len(self.calls), 3)
+
+    def test_last_chunk_has_no_neighbour_to_take_its_tail(self):
+        def per_chunk(start, ws):
+            if start == 200:
+                return ([(i * 2.0, i * 2.0 + 0.5, w) for i, w in enumerate(ws[:-5])]
+                        + [(30.0, 30.0, w) for w in ws[-5:]])
+            return self._spread(ws)
+        self._install(per_chunk)
+        self._align()
+        self.assertEqual(len(self.calls), 3)
+
+    def test_realign_off_with_zero_passes(self):
+        def per_chunk(start, ws):
+            if start == 0:
+                return ([(i * 2.0, i * 2.0 + 0.5, w) for i, w in enumerate(ws[:-5])]
+                        + [(40.0, 40.0, w) for w in ws[-5:]])
+            return self._spread(ws)
+        self._install(per_chunk)
+        self._align(realign_passes=0)
+        self.assertEqual(len(self.calls), 3)
+
+    def test_word_count_mismatch_is_not_moved(self):
+        # The aligner returned fewer words than it was sent: the tail can't be
+        # mapped back onto the transcript, so the boundary stays where it was.
+        def per_chunk(start, ws):
+            if start == 0:
+                return ([(i * 2.0, i * 2.0 + 0.5, w) for i, w in enumerate(ws[:10])]
+                        + [(40.0, 40.0, w) for w in ws[10:19]])
+            return self._spread(ws)
+        self._install(per_chunk)
+        self._align()
+        self.assertEqual(len(self.calls), 3)
+
+    def test_transcribing_never_realigns(self):
+        def per_chunk(start, ws):
+            return [(0, 1, "a"), (2, 3, "b")] + [(40.0, 40.0, "z")] * 5
+        self._install(per_chunk)
+        with redirect_stderr(io.StringIO()):
+            N.align_words(Path("x.wav"), "1.7B", "en", chunk_seconds=100)
+        self.assertEqual(len(self.calls), 3)
+
+
+class TestCollapsedTail(unittest.TestCase):
+    W = staticmethod(lambda s, e: N.Word("x", s, e))
+
+    def test_ten_words_at_one_timestamp(self):
+        ws = [self.W(i, i + 0.5) for i in range(10)] + [self.W(50, 50)] * 10
+        self.assertEqual(N.collapsed_tail(ws), 10)
+
+    def test_scattered_zero_runs_in_normal_speech_are_not_a_tail(self):
+        # Short words share one 0.08s tick all through healthy speech (the
+        # saved EdTech run has runs of three in its best chunk): ~2.5 words/s.
+        ws = []
+        t = 0.0
+        for i in range(60):
+            d = 0.0 if i % 10 in (3, 4, 5) else 0.32
+            ws.append(self.W(t, t + d))
+            t += 0.4
+        self.assertIsNone(N.collapsed_tail(ws))
+
+    def test_a_crushed_start_is_not_a_tail(self):
+        ws = [self.W(0, 0)] * 3 + [self.W(i, i + 0.5) for i in range(1, 30)]
+        self.assertIsNone(N.collapsed_tail(ws))
+
+    def test_real_fixture_has_no_tail(self):
+        words = N.parse_align((FIX / "align_sample.txt").read_text())
+        self.assertIsNone(N.collapsed_tail(words))
+
+
+class TestAlignReport(unittest.TestCase):
+    def test_fixture_share_and_coverage(self):
+        # align_sample.txt: one 100s chunk, 231 words; counted by hand from the
+        # bracket lines, 85 have end == start (the 0.08s tick, so under 0.05s)
+        # and the last word ends at 89.12s.
+        words = N.parse_align((FIX / "align_sample.txt").read_text())
+        rep = N.align_report([N.AlignChunk(0.0, 100.0, words)])
+        self.assertEqual(rep["words"], 231)
+        self.assertEqual(rep["near_zero"], 85)
+        self.assertAlmostEqual(rep["share"], 85 / 231)
+        self.assertAlmostEqual(rep["rows"][0]["coverage"], 0.8912)
+        text = N.render_align_report(rep)
+        self.assertIn("36.8%", text)
+        self.assertIn("89%", text)
+
+    def test_saved_run_is_rebuilt_into_its_chunks(self):
+        words = [N.Word("a", 10, 10), N.Word("b", 20, 21),
+                 N.Word("c", 130, 131), N.Word("d", 245, 246)]
+        chunks = N.chunks_from_words(words, dur=240.0, chunk_seconds=120)
+        self.assertEqual([len(c.words) for c in chunks], [2, 2])
+        self.assertEqual(chunks[1].words[0].start, 10)     # chunk-local time
+        rep = N.align_report(chunks)
+        self.assertEqual([r["near_zero"] for r in rep["rows"]], [1, 0])
+        self.assertAlmostEqual(rep["rows"][0]["coverage"], 21 / 120)
+
+    def test_trace_has_pass_one_and_final(self):
+        orig = (N._wav_duration, N.run_align)
+        try:
+            N._wav_duration = lambda wav: 50
+            N.run_align = lambda *a, **k: "[0.00s - 1.00s] hi\n[40.00s - 40.00s] x"
+            trace = {}
+            N.align_words(Path("x.wav"), "1.7B", "en", transcript="hi x",
+                          chunk_seconds=120, trace=trace)
+        finally:
+            N._wav_duration, N.run_align = orig
+        self.assertEqual(N.align_report(trace["final"])["near_zero"], 1)
+        self.assertIs(trace["first"][0], trace["final"][0])
+
+    def test_run_report_prints_both_numbers_the_decision_rule_reads(self):
+        crushed = N.AlignChunk(0.0, 100.0, [N.Word("a", 0, 1)] + [N.Word("b", 40, 40)] * 3)
+        fixed = N.AlignChunk(0.0, 100.0, [N.Word("a", 0, 1), N.Word("b", 50, 51),
+                                          N.Word("b", 70, 71), N.Word("b", 90, 91)])
+        turns = [N.Turn("SPEAKER_00", 0, 45), N.Turn("SPEAKER_01", 45, 100)]
+        out = io.StringIO()
+        with mock.patch("sys.stdout", out):
+            N.print_align_trace({"first": [crushed], "final": [fixed],
+                                 "passes": [{0: 3}]}, turns)
+        text = out.getvalue()
+        self.assertIn("pass one: 75.0% near-zero, 1 segments after tidy", text)
+        self.assertIn("final:    0.0% near-zero, 2 segments after tidy", text)
+        self.assertIn("1 realign pass(es), 3 words moved", text)
 
 
 # --------------------------------------------------------------------------- #
