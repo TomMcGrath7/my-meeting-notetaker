@@ -254,58 +254,199 @@ class AlignmentCollapse(RuntimeError):
     i.e. the aligner piled a chunk's words into the front of its window, so the
     timestamps there can't be trusted for speaker attribution."""
 
+# Second pass for force-align (plan 321). A pasted transcript is untimed, so the
+# first pass splits it by word COUNT; where the speaking rate drifts, a chunk
+# gets more text than its audio holds and the aligner crushes the excess into a
+# tail of zero-length words (the timestamp quantum is 0.08s, so "under 0.05s"
+# means zero). Those words were really spoken in the next chunk: the second pass
+# moves the text boundary to the last well-timed word, re-aligns that chunk and
+# its right neighbour only, and repeats at most REALIGN_PASSES times.
+#
+# A tail is a run of TAIL_RUN zero-length words from which the rest of the chunk
+# is packed faster than anyone speaks (TAIL_WORDS_PER_SECOND; speech is 2 to 4).
+# The rate test matters: on the EdTech call's saved run, runs of three zero
+# words sit all through healthy stretches (short words land on one 0.08s tick),
+# so "the first run of three" alone would move half of a good chunk's text.
+NEAR_ZERO_SECONDS = 0.05
+TAIL_RUN = 3
+TAIL_WORDS_PER_SECOND = 6.0
+REALIGN_PASSES = 2
+REALIGN_MAX_COVERAGE = 0.90   # a chunk already covering this much is left alone
+
+@dataclass
+class AlignChunk:
+    start: float               # where the chunk sits on the real timeline
+    length: float
+    words: list[Word]          # chunk-local times, as the aligner returned them
+    text: list[str] | None = None   # transcript words sent (force-align only)
+
+    @property
+    def coverage(self) -> float:
+        if not self.words or self.length <= 0:
+            return 0.0
+        return max(w.end for w in self.words) / self.length
+
+    @property
+    def near_zero(self) -> int:
+        return sum(1 for w in self.words if _near_zero(w))
+
+def _near_zero(w: Word) -> bool:
+    return (w.end - w.start) < NEAR_ZERO_SECONDS
+
+def collapsed_tail(words: list[Word]) -> int | None:
+    """Index of the first word of a collapsed tail, or None. Index 0 is never a
+    tail: there has to be a last well-timed word to cut after."""
+    n = len(words)
+    for k in range(1, n - TAIL_RUN + 1):
+        if not all(_near_zero(words[j]) for j in range(k, k + TAIL_RUN)):
+            continue
+        span = words[-1].end - words[k].start
+        if (n - k) >= TAIL_WORDS_PER_SECOND * span:
+            return k
+    return None
+
+def _stitch(chunks: list[AlignChunk]) -> list[Word]:
+    return [Word(text=w.text, start=w.start + c.start, end=w.end + c.start)
+            for c in chunks for w in c.words]
+
 def align_words(wav: Path, model: str, language: str | None,
                 transcript: str | None = None,
                 chunk_seconds: float = ALIGN_CHUNK_SECONDS,
                 strict: bool = False,
-                progress=None) -> list[Word]:
+                progress=None,
+                realign_passes: int = REALIGN_PASSES,
+                trace: dict | None = None) -> list[Word]:
     """Word-level timestamps for the whole file, chunking long audio (see note
     on ALIGN_CHUNK_SECONDS). With a `transcript` (e.g. exported from Voice
     Memos), each chunk is force-aligned against its share of the text, split in
-    proportion to chunk duration — best-effort, since the source text is untimed.
+    proportion to chunk duration, then re-split where a chunk's tail collapsed
+    (see REALIGN_PASSES). Best-effort, since the source text is untimed.
+
+    `trace`, when given, is filled with the chunks as pass one left them
+    ("first"), as they stand at the end ("final"), and the realign passes run
+    ("passes", a list of {chunk index: words moved}), for align_report().
     """
     dur = _wav_duration(wav)
     if dur <= chunk_seconds + 1.0:
-        return parse_align(run_align(wav, model, language, transcript))
+        words = parse_align(run_align(wav, model, language, transcript))
+        if trace is not None:
+            one = AlignChunk(0.0, dur, words,
+                             transcript.split() if transcript else None)
+            trace.update(first=[one], final=[one], passes=[])
+        return words
 
     n = int(dur // chunk_seconds) + (1 if dur % chunk_seconds else 0)
     text_words = transcript.split() if transcript else None
-    words: list[Word] = []
-    squashed = 0
     tmp = wav.parent / "_align_chunk.wav"
-    for i in range(n):
+
+    def align_chunk(i: int, a: int = 0, b: int = 0) -> AlignChunk:
         start = i * chunk_seconds
         length = min(chunk_seconds, dur - start)
         _cut_wav(wav, start, length, tmp)
-        slice_text = None
-        if text_words is not None:
-            a = (i * len(text_words)) // n
-            b = ((i + 1) * len(text_words)) // n
-            slice_text = " ".join(text_words[a:b]) or None
-        local = parse_align(run_align(tmp, model, language, slice_text))
-        # Collapse guard: a healthy chunk spreads its words across the window.
-        # When the aligner overloads it dumps everything into the front, leaving
-        # the tail empty — that scrambles speaker attribution, so flag it loudly.
-        if local and length > 30 and max(w.end for w in local) < 0.6 * length:
-            squashed += 1
-            print(f"  ⚠️  chunk {i + 1}/{n}: {len(local)} words collapsed into "
-                  f"{max(w.end for w in local):.0f}s of a {length:.0f}s window "
-                  f"— timestamps unreliable here", file=sys.stderr)
-        for w in local:
-            words.append(Word(text=w.text, start=w.start + start, end=w.end + start))
+        sent = text_words[a:b] if text_words is not None else None
+        local = parse_align(run_align(tmp, model, language,
+                                      " ".join(sent) if sent else None))
+        return AlignChunk(start, length, local, sent)
+
+    bounds = ([(i * len(text_words)) // n for i in range(n + 1)]
+              if text_words is not None else None)
+    chunks: list[AlignChunk] = []
+    total = 0
+    for i in range(n):
+        c = align_chunk(i, *(bounds[i:i + 2] if bounds else (0, 0)))
+        chunks.append(c)
+        total += len(c.words)
         if progress:
-            progress(i + 1, n, len(words))
+            progress(i + 1, n, total)
+    first = list(chunks)
+
+    passes: list[dict[int, int]] = []
+    for p in range(realign_passes if bounds else 0):
+        old = list(bounds)
+        moved: dict[int, int] = {}
+        for i, c in enumerate(chunks[:-1]):
+            if (c.text is None or len(c.words) != len(c.text)
+                    or c.coverage > REALIGN_MAX_COVERAGE):
+                continue   # healthy, or words we can't map back to the text
+            k = collapsed_tail(c.words)
+            if k is not None:
+                bounds[i + 1] = old[i] + k
+                moved[i] = len(c.words) - k
+        if not moved:
+            break
+        passes.append(moved)
+        redo = sorted({j for i in moved for j in (i, i + 1)})
+        print(f"  re-aligning chunks {', '.join(str(j + 1) for j in redo)} "
+              f"(pass {p + 1}/{realign_passes}: {sum(moved.values())} words "
+              f"from a collapsed tail moved on)")
+        for j in redo:
+            chunks[j] = align_chunk(j, bounds[j], bounds[j + 1])
+
+    # Collapse guard: a healthy chunk spreads its words across the window.
+    # When the aligner overloads it dumps everything into the front, leaving
+    # the tail empty — that scrambles speaker attribution, so flag it loudly.
+    squashed = 0
+    for i, c in enumerate(chunks):
+        if c.words and c.length > 30 and c.coverage < 0.6:
+            squashed += 1
+            print(f"  ⚠️  chunk {i + 1}/{n}: {len(c.words)} words collapsed into "
+                  f"{max(w.end for w in c.words):.0f}s of a {c.length:.0f}s window "
+                  f"— timestamps unreliable here", file=sys.stderr)
+    if trace is not None:
+        trace.update(first=first, final=chunks, passes=passes)
+    try:
+        tmp.unlink()
+    except OSError:
+        pass
     if squashed:
         print(f"  ⚠️  {squashed}/{n} chunks collapsed — try a smaller "
               f"--align-chunk (current {chunk_seconds:.0f}s)", file=sys.stderr)
         if strict:
             raise AlignmentCollapse(
                 f"{squashed}/{n} align chunks collapsed at {chunk_seconds:.0f}s")
-    try:
-        tmp.unlink()
-    except OSError:
-        pass
-    return words
+    return _stitch(chunks)
+
+def chunks_from_words(words: list[Word], dur: float,
+                      chunk_seconds: float) -> list[AlignChunk]:
+    """Rebuild a saved run's chunks (pipeline.json keeps only the stitched
+    words). A word's start says which chunk it came from, since the aligner
+    keeps to its own window; only the last chunk was seen to run past the end
+    of the audio (to 130% on the EdTech call), and it is clamped to that chunk.
+    `chunk_seconds` must be the size that run used (the EdTech call's saved run
+    was 300s, today's force-align is 120s).
+    """
+    n = max(1, int(dur // chunk_seconds) + (1 if dur % chunk_seconds else 0))
+    chunks = [AlignChunk(i * chunk_seconds, min(chunk_seconds, dur - i * chunk_seconds), [])
+              for i in range(n)]
+    for w in words:
+        i = min(n - 1, max(0, int(w.start // chunk_seconds)))
+        c = chunks[i]
+        c.words.append(Word(w.text, w.start - c.start, w.end - c.start))
+    return chunks
+
+def align_report(chunks: list[AlignChunk]) -> dict:
+    """Per chunk: words, the share under NEAR_ZERO_SECONDS, window coverage."""
+    rows = [{"chunk": i + 1, "start": c.start, "words": len(c.words),
+             "near_zero": c.near_zero,
+             "share": c.near_zero / len(c.words) if c.words else 0.0,
+             "coverage": c.coverage}
+            for i, c in enumerate(chunks)]
+    words = sum(r["words"] for r in rows)
+    near = sum(r["near_zero"] for r in rows)
+    return {"rows": rows, "words": words, "near_zero": near,
+            "share": near / words if words else 0.0,
+            "worst_coverage": min((r["coverage"] for r in rows if r["words"]),
+                                  default=0.0)}
+
+def render_align_report(rep: dict) -> str:
+    lines = ["  chunk   start  words  near-zero  coverage"]
+    for r in rep["rows"]:
+        lines.append(f"  {r['chunk']:>5}  {hhmmss(r['start']):>6}  {r['words']:>5}"
+                     f"  {r['share']:>8.1%}  {r['coverage']:>8.0%}")
+    lines.append(f"  total: {rep['words']} words, {rep['near_zero']} under "
+                 f"{NEAR_ZERO_SECONDS}s ({rep['share']:.1%}); worst chunk "
+                 f"coverage {rep['worst_coverage']:.0%}")
+    return "\n".join(lines)
 
 def parse_align(raw: str) -> list[Word]:
     # The real `speech align` output is one bracketed line per word, e.g.
@@ -1195,6 +1336,35 @@ def render_english(segs: list[Segment], english: list[str]) -> str:
 # commands
 # --------------------------------------------------------------------------- #
 
+def print_align_trace(trace: dict, turns: list[Turn]) -> None:
+    """The --align-report block: per-chunk table as the run ends, and the two
+    numbers plan 321's decision rule reads, before and after the second pass
+    (near-zero share, and segments after tidy_segments, labels still raw)."""
+    if not trace.get("final"):
+        return
+    print("• align report (after the realign passes)")
+    print(render_align_report(align_report(trace["final"])))
+    first, final = align_report(trace["first"]), align_report(trace["final"])
+    segs = lambda chunks: len(tidy_segments(merge(_stitch(chunks), turns)))
+    moved = sum(sum(p.values()) for p in trace.get("passes", []))
+    print(f"  pass one: {first['share']:.1%} near-zero, "
+          f"{segs(trace['first'])} segments after tidy")
+    print(f"  final:    {final['share']:.1%} near-zero, "
+          f"{segs(trace['final'])} segments after tidy "
+          f"({len(trace.get('passes', []))} realign pass(es), {moved} words moved)")
+
+def cmd_align_report(args):
+    """Per-chunk near-zero share and coverage for a saved pipeline.json."""
+    path = Path(args.pipeline)
+    pipe = Pipeline.from_json(path.read_text())
+    if not pipe.words:
+        sys.exit(f"error: {path} has no words")
+    wav = Path(args.audio) if args.audio else path.parent / "audio.wav"
+    dur = _wav_duration(wav) if wav.exists() else max(w.end for w in pipe.words)
+    print(f"{path}: {dur/60:.0f} min at {args.align_chunk:.0f}s chunks")
+    print(render_align_report(align_report(
+        chunks_from_words(pipe.words, dur, args.align_chunk))))
+
 def cmd_check(args):
     """Run diarize + align on a file and show raw vs parsed, to verify schemas."""
     need("speech")
@@ -1308,15 +1478,22 @@ def cmd_run(args):
             if words is None:
                 print("  no speech found by the VAD; transcribing the whole file")
         if words is None:
+            trace: dict = {}
             try:
                 words = align_words(wav, args.model, args.language,
                                     transcript=transcript_text,
                                     chunk_seconds=align_chunk,
                                     strict=args.strict,
-                                    progress=progress)
+                                    progress=progress,
+                                    realign_passes=args.realign_passes,
+                                    trace=trace)
             except AlignmentCollapse as e:
+                if args.align_report:
+                    print_align_trace(trace, turns)
                 sys.exit(f"error: {e}. Re-run with a smaller --align-chunk, or drop "
                          f"--strict to accept the unreliable timestamps.")
+            if args.align_report:
+                print_align_trace(trace, turns)
         if not transcript_text:
             words, dropped = drop_loops(words)
             if dropped:
@@ -1414,6 +1591,18 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("file")
     c.set_defaults(func=cmd_check)
 
+    a = sub.add_parser("align-report",
+                       help="per-chunk near-zero share + coverage of a saved run")
+    a.add_argument("pipeline", help="a run's pipeline.json")
+    a.add_argument("--align-chunk", type=float, default=ALIGN_CHUNK_SECONDS_FORCED,
+                   help=f"the chunk size that run aligned with (default "
+                        f"{int(ALIGN_CHUNK_SECONDS_FORCED)}; out-20260702-001651 "
+                        f"used 300)")
+    a.add_argument("--audio", default=None,
+                   help="the run's wav, for its length (default audio.wav beside "
+                        "the json; else the last word's end)")
+    a.set_defaults(func=cmd_align_report)
+
     r = sub.add_parser("run", parents=[common], help="full pipeline")
     r.add_argument("file", nargs="?", help="audio file (m4a/wav/mp3/caf)")
     r.add_argument("--config", default="config.yaml",
@@ -1447,6 +1636,13 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--strict", action="store_true",
                    help="fail the run (non-zero exit) if any alignment chunk "
                         "collapses, instead of emitting a warning and continuing")
+    r.add_argument("--realign-passes", type=int, default=REALIGN_PASSES,
+                   help=f"with --transcript: times a chunk whose tail collapsed "
+                        f"gets its text boundary moved and is re-aligned with its "
+                        f"right neighbour (default {REALIGN_PASSES}; 0 = off)")
+    r.add_argument("--align-report", action="store_true",
+                   help="print per-chunk word counts, near-zero share and window "
+                        "coverage after aligning, before and after the realign pass")
     r.add_argument("--no-notes", action="store_true",
                    help="skip the notes-generation LLM step")
     r.add_argument("--from-json",
