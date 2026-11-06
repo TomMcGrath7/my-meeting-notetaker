@@ -80,8 +80,7 @@ exactly by force-aligning that chunk's assigned text against its audio.
   drift but don't remove it. Fixing properly needs timed source text or a
   per-chunk realignment that re-estimates the split.
 
-  **The realignment is now built (plan 321), and the verdict waits on one live
-  run.** After pass one, a chunk with coverage at or under 90% whose tail
+  **The realignment is built (plan 321); its verdict is below.** After pass one, a chunk with coverage at or under 90% whose tail
   collapsed hands that tail to the next chunk's text, and only those two chunks
   are aligned again, at most `REALIGN_PASSES = 2` times. A tail is a run of
   three words under 0.05s from which the rest of the chunk is packed at 6+ words
@@ -112,6 +111,27 @@ exactly by force-aligning that chunk's assigned text against its audio.
   final numbers here and accept the residual. `run --align-report` prints both
   numbers from a single run (the segment counts are taken on raw labels, before
   the LLM relabel, the same way on both sides).
+
+  **Verdict (live run, 2026-11-06): the residual is accepted.** One `run
+  --transcript --align-report --strict --no-notes` on the EdTech call's
+  `audio.wav` (120s chunks, 29 of them, about 4 minutes). The
+  source text was the saved run's own 8321 words, since the original pasted
+  transcript was not kept.
+
+  | what | near-zero | worst coverage | segments after tidy |
+  |---|---|---|---|
+  | pass one | **27.6%** (2249 of 8157) | 80% (chunk 22) | 3 |
+  | final, after the realign | **27.6%** | 80% | 3 |
+
+  The realign fired once (chunks 22 and 23, 30 words moved) and did not move the
+  total. No chunk collapsed, so `--strict` held. The earlier 120s figure (~36%)
+  was on the original pasted text, so the two are not a clean before and after;
+  within this run, pass one and final are, and the second pass adds nothing
+  measurable. The near-zero
+  words are short words on a single aligner tick inside well-placed speech, as
+  the fixture predicted, and one chunk (27, 52:00) sits at 73.5% on its own.
+  The pass stays in, since it is cheap and harmless, but it is not the
+  lever. Timed source text is.
 - **Mid-sentence cuts at genuine speaker changes** remain (see rejected
   sentence-snapping). They read slightly rough but are correctly attributed.
 - **ASR text errors** ("loci method" → "Loki", "NotebookLM" → "no Boog LM") are
