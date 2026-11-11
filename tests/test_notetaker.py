@@ -21,6 +21,9 @@ guard the timestamp-collapse bug:
   - llm (ollama backend)                        : the context window is sized to
     the prompt and capped, an over-cap or clipped prompt fails loudly, and
     without llm-seam the call falls back to the deprecated /v1 path.
+  - two recordings (--second)                   : the word-based offset and
+    drift, the shared windows cut at pauses, the LLM judge's id check, the
+    ranking, and what `run --second` writes (docs/two-recordings.md).
 
 The ollama-backend tests that drive llm-seam's real client are skipped when
 llm-seam is not installed (it is optional). Run both ways:
@@ -1257,6 +1260,442 @@ class TestTranslate(unittest.TestCase):
                 self.assertEqual(path.exists(), expect, lang)
                 if expect:
                     self.assertIn("Hello.", path.read_text())
+
+
+# --------------------------------------------------------------------------- #
+# two recordings of one conversation (--second; docs/two-recordings.md)
+# --------------------------------------------------------------------------- #
+
+def _talk(n, start=0.0, step=0.5, pause_every=20, pause=2.0, prefix="w"):
+    """n distinct words, `step` apart, with a `pause` after every
+    `pause_every`-th: enough structure to sync on and to cut windows at."""
+    words, t = [], start
+    for i in range(n):
+        words.append(N.Word(f"{prefix}{i}", t, t + 0.3))
+        t += step + (pause if (i + 1) % pause_every == 0 else 0.0)
+    return words
+
+
+def _shift(words, offset, drift=0.0):
+    f = lambda t: t + offset + drift * t
+    return [N.Word(w.text, f(w.start), f(w.end)) for w in words]
+
+
+class TestSyncRecordings(unittest.TestCase):
+    def test_offset_is_found_from_the_words(self):
+        a = _talk(200)
+        sync = N.sync_recordings(a, _shift(a, 1015.5))
+        self.assertAlmostEqual(sync.offset, 1015.5, places=3)
+        self.assertEqual(sync.drift, 0.0)
+        self.assertAlmostEqual(sync.to_primary(1015.5 + a[7].start), a[7].start)
+        self.assertAlmostEqual(sync.to_second(a[7].start), 1015.5 + a[7].start)
+
+    def test_case_accents_and_punctuation_do_not_stop_a_match(self):
+        a = [N.Word(t, i, i + 0.3) for i, t in enumerate(
+            "la reunión de producción fue ayer por la tarde con todos".split())]
+        b = [N.Word(t, i + 40, i + 40.3) for i, t in enumerate(
+            "La reunion, de PRODUCCION fue ayer. por la tarde con todos".split())]
+        with mock.patch.object(N, "SYNC_MIN_RUNS", 1):
+            sync = N.sync_recordings(a, b)
+        self.assertAlmostEqual(sync.offset, 40.0)
+
+    def test_the_second_started_later_and_misheard_words(self):
+        # B began 60s into A (so lacks A's first words) and garbles 1 word in 9.
+        a = _talk(300)
+        b = [N.Word("zzz" if i % 9 == 0 else w.text, w.start, w.end)
+             for i, w in enumerate(_shift(a, -60.0)) if w.start >= 0]
+        sync = N.sync_recordings(a, b)
+        self.assertAlmostEqual(sync.offset, -60.0, places=3)
+        self.assertGreater(sync.runs, 10)
+        self.assertEqual(sync.agreeing, sync.runs)
+
+    def test_drift_is_fitted_across_a_long_recording(self):
+        a = _talk(2000)                      # about 20 minutes
+        drift = 0.5 / 3600                   # half a second an hour
+        sync = N.sync_recordings(
+            a, [N.Word("zzz" if i % 30 == 0 else w.text, w.start, w.end)
+                for i, w in enumerate(_shift(a, 100.0, drift))])
+        self.assertAlmostEqual(sync.drift, drift, places=7)
+        self.assertAlmostEqual(sync.offset, 100.0, places=2)
+
+    def test_a_short_pair_gets_no_drift_fit(self):
+        a = _talk(200)
+        b = [N.Word("zzz" if i % 30 == 0 else w.text, w.start, w.end)
+             for i, w in enumerate(_shift(a, 5.0, 0.01))]
+        self.assertEqual(N.sync_recordings(a, b).drift, 0.0)
+
+    def test_two_different_conversations_do_not_sync(self):
+        self.assertIsNone(N.sync_recordings(_talk(200), _talk(200, prefix="x")))
+
+    def test_one_shared_phrase_is_not_a_match(self):
+        a, b = _talk(200), _talk(200, prefix="x")
+        b[50:56] = [N.Word(w.text, 9.0, 9.3) for w in a[10:16]]
+        self.assertIsNone(N.sync_recordings(a, b))
+
+    def test_empty_transcripts_do_not_sync(self):
+        self.assertIsNone(N.sync_recordings([], _talk(50)))
+
+
+class TestMergeWindows(unittest.TestCase):
+    def test_a_window_ends_at_a_pause_once_it_is_long_enough(self):
+        # 20 words at 0.5s = 9.8s of talk, then a 2s pause: one window each.
+        ws = N.merge_windows(_talk(60), [])
+        self.assertEqual(len(ws), 3)
+        self.assertEqual(ws[0].a.split()[0], "w0")
+        self.assertEqual(ws[1].a.split()[0], "w20")
+        self.assertTrue(all(w.b == "" and w.overlap is None for w in ws))
+
+    def test_a_pause_in_a_short_window_does_not_cut(self):
+        # a pause every 10 words (4.8s of talk) is under WINDOW_MIN, so every
+        # other pause is the cut.
+        ws = N.merge_windows(_talk(40, pause_every=10), [])
+        self.assertEqual([len(w.a.split()) for w in ws], [20, 20])
+
+    def test_hard_cut_when_nobody_pauses(self):
+        ws = N.merge_windows(_talk(200, pause_every=10**6), [])
+        self.assertGreater(len(ws), 1)
+        for w in ws:
+            self.assertLessEqual(w.end - w.start, N.WINDOW_MAX + 0.5)
+        self.assertEqual(sum(len(w.a.split()) for w in ws), 200)
+
+    def test_one_recording_talking_through_the_others_pause_holds_the_window(self):
+        a = _talk(40)                                   # pauses after word 20
+        b = [N.Word(f"b{i}", 9.9 + i * 0.4, 10.2 + i * 0.4) for i in range(6)]
+        ws = N.merge_windows(a, b)
+        self.assertEqual(len(ws), 1)
+        self.assertEqual(len(ws[0].b.split()), 6)
+
+    def test_both_recordings_are_paired_and_scored(self):
+        a = _talk(40)
+        b = [N.Word("other" if 20 <= i < 40 else w.text, w.start + 0.05, w.end)
+             for i, w in enumerate(a)]
+        ws = N.merge_windows(a, b)
+        self.assertEqual(len(ws), 2)
+        self.assertEqual(ws[0].overlap, 1.0)
+        self.assertEqual(ws[1].overlap, 0.0)
+        self.assertAlmostEqual(ws[1].a_at, (a[20].start + a[20].end) / 2)
+
+    def test_a_stretch_only_the_second_has_is_its_own_window(self):
+        a = _talk(20, start=100.0)
+        b = _talk(20, start=-50.0, prefix="b")          # before A began
+        ws = N.merge_windows(a, b)
+        self.assertEqual([(bool(w.a), bool(w.b)) for w in ws],
+                         [(False, True), (True, False)])
+        self.assertLess(ws[0].start, 0)
+
+    def test_nothing_in_nothing_out(self):
+        self.assertEqual(N.merge_windows([], []), [])
+
+
+def _windows():
+    return [N.MergeWindow(0, 9, a="we ship on Monday", b="we ship on Sunday",
+                          overlap=0.75),
+            N.MergeWindow(10, 19, a="hello there", b="hello there", overlap=1.0),
+            N.MergeWindow(20, 29, a="mm the thing", b="uh a thing", overlap=0.33),
+            N.MergeWindow(30, 39, a="only A here"),
+            N.MergeWindow(40, 49, a="xx yy", b="pp qq", overlap=0.0)]
+
+
+class TestJudgeWindows(unittest.TestCase):
+    KW = dict(backend="openai", model="m", base_url="", num_ctx_max=None)
+
+    def test_verdicts_land_on_the_windows_that_both_recordings_have(self):
+        ws = _windows()
+        reply = json.dumps([
+            {"id": 0, "verdict": "differ", "note": "Monday vs Sunday"},
+            {"id": 1, "verdict": "same", "note": ""},
+            {"id": 2, "verdict": "SAME"},
+            {"id": 4, "verdict": "unclear", "note": "garbled"}])
+        with mock.patch.object(N, "llm", return_value=reply) as llm:
+            self.assertEqual(N.judge_windows(ws, **self.KW), 0)
+        self.assertEqual([w.verdict for w in ws],
+                         ["differ", "same", "same", "", "unclear"])
+        self.assertEqual(ws[0].note, "Monday vs Sunday")
+        sent = json.loads(llm.call_args.args[0][0]["content"])
+        self.assertEqual([x["id"] for x in sent], [0, 1, 2, 4])   # not window 3
+
+    def test_a_missing_id_is_counted_and_left_unjudged(self):
+        ws = _windows()
+        reply = ('Here you go:\n```json\n[{"id": 0, "verdict": "same"}, '
+                 '{"id": 99, "verdict": "differ"}, {"id": 2, "verdict": "maybe"}]\n```')
+        err = io.StringIO()
+        with mock.patch.object(N, "llm", return_value=reply), redirect_stderr(err):
+            self.assertEqual(N.judge_windows(ws, **self.KW), 3)
+        self.assertEqual([w.verdict for w in ws], ["same", "", "", "", ""])
+        self.assertIn("3 of 4 windows", err.getvalue())
+
+    def test_prose_instead_of_json_leaves_everything_unjudged(self):
+        ws = _windows()
+        with mock.patch.object(N, "llm", return_value="They mostly agree."), \
+                redirect_stderr(io.StringIO()):
+            self.assertEqual(N.judge_windows(ws, **self.KW), 4)
+        self.assertTrue(all(w.verdict == "" for w in ws))
+
+    def test_windows_go_out_in_batches_and_an_id_from_another_batch_is_refused(self):
+        ws = [N.MergeWindow(i, i + 1, a=f"a{i}", b=f"b{i}", overlap=0.0)
+              for i in range(N.JUDGE_BATCH + 5)]
+        calls = []
+        def fake(messages, system, **kw):
+            ids = [x["id"] for x in json.loads(messages[0]["content"])]
+            calls.append(ids)
+            return json.dumps([{"id": i, "verdict": "same"} for i in ids]
+                              + [{"id": 0, "verdict": "differ"}])
+        with mock.patch.object(N, "llm", side_effect=fake):
+            self.assertEqual(N.judge_windows(ws, **self.KW), 0)
+        self.assertEqual([len(c) for c in calls], [N.JUDGE_BATCH, 5])
+        # the second batch's stray {"id": 0, "differ"} did not overwrite it...
+        # but the first batch's own did, being last in that batch's reply.
+        self.assertEqual(ws[0].verdict, "differ")
+        self.assertTrue(all(w.verdict == "same" for w in ws[1:]))
+
+
+class TestRankAndRender(unittest.TestCase):
+    SYNC = N.Sync(offset=60.0, drift=0.0, runs=12, agreeing=11)
+
+    def test_judged_differ_first_then_unjudged_then_unclear_and_same_is_left_out(self):
+        ws = _windows()
+        ws[0].verdict, ws[1].verdict, ws[4].verdict = "differ", "same", "unclear"
+        self.assertEqual([w.start for w in N.rank_disagreements(ws)], [0, 20, 40])
+
+    def test_unjudged_is_ranked_by_overlap_and_capped(self):
+        self.assertEqual([w.start for w in N.rank_disagreements(_windows())],
+                         [40, 20, 0, 10])
+        many = [N.MergeWindow(i, i + 1, a="x", b="y", overlap=i / 100)
+                for i in range(N.DISAGREE_TOP + 10)]
+        ranked = N.rank_disagreements(many)
+        self.assertEqual(len(ranked), N.DISAGREE_TOP)
+        self.assertEqual(ranked[0].overlap, 0.0)
+
+    def test_phrase_diff_keeps_shared_phrases_and_pairs_the_rest(self):
+        self.assertEqual(
+            N.phrase_diff("La reunión de producción fue ayer",
+                          "la reunion de relación fue ayer tarde"),
+            [("La reunión de", "La reunión de"), ("producción", "relación"),
+             ("fue ayer", "fue ayer"), ("", "tarde")])
+
+    def test_signed_time(self):
+        self.assertEqual(N.signed_hhmmss(75), "1:15")
+        self.assertEqual(N.signed_hhmmss(-1023), "-17:03")
+        self.assertEqual(N.signed_hhmmss(-0.02), "0:00")     # never "-0:00"
+
+    def test_merged_transcript_is_the_primary_with_b_only_where_it_matters(self):
+        ws = _windows()
+        for w in ws:
+            w.a_at = w.start + 0.1 if w.a else None
+        ws[0].verdict, ws[0].note = "differ", "Monday vs Sunday"
+        ws[1].verdict = ws[2].verdict = "same"
+        ws.insert(0, N.MergeWindow(-30, -21, b="before A began"))
+        ws.insert(5, N.MergeWindow(35, 36, b="invented sentence"))
+        segs = [N.Segment("Tom", 0, 25, ""), N.Segment("Olly", 25, 60, "")]
+        md = N.render_merged(ws, segs, "a.m4a", "b.m4a")
+        self.assertIn("**B only** (-0:30)\nbefore A began", md)
+        self.assertIn("**Tom** (0:00)\nwe ship on Monday\n"
+                      "> B heard (Monday vs Sunday): we ship on Sunday", md)
+        # agreeing windows of one speaker run together, with no B line
+        self.assertIn("**Tom** (0:10)\nhello there mm the thing\n", md)
+        self.assertNotIn("uh a thing", md)
+        self.assertIn("**Olly** (0:30)\nonly A here", md)
+        self.assertIn("**B only ⚠️ unconfirmed", md)
+        self.assertIn("invented sentence", md)
+        self.assertNotIn("pp qq", md)        # unclear is not shown as a B line
+
+    def test_a_b_line_sits_under_only_the_window_it_answers(self):
+        ws = _windows()[:3]
+        for w in ws:
+            w.a_at = w.start
+        ws[0].verdict = ws[2].verdict = "same"
+        ws[1].verdict = "differ"
+        md = N.render_merged(ws, [N.Segment("Tom", 0, 60, "")], "a", "b")
+        self.assertIn("**Tom** (0:00)\nwe ship on Monday\n\n"
+                      "**Tom** (0:10)\nhello there\n> B heard: hello there\n\n"
+                      "**Tom** (0:20)\nmm the thing\n", md)
+
+    def test_disagreements_file_ranks_and_shows_phrases_and_both_clocks(self):
+        ws = _windows()
+        ws[0].verdict, ws[0].note = "differ", "Monday vs Sunday"
+        ws[1].verdict = ws[2].verdict = "same"
+        ws.insert(3, N.MergeWindow(22, 23, b="invented sentence"))
+        md = N.render_disagreements(ws, self.SYNC, "a.m4a", "b.m4a")
+        self.assertIn("11 of 12 matching runs agree on an offset of 60.0s", md)
+        self.assertIn("6 windows: 4 heard by both, 1 by A only, 1 by B only", md)
+        self.assertIn("2 same, 1 differ, 0 unclear, 1 not judged", md)
+        self.assertIn("### 1. A 0:00 / B 1:00 (differ: Monday vs Sunday; "
+                      "word overlap 0.75)", md)
+        self.assertIn("- both: we ship on\n- A: Monday\n  B: Sunday", md)
+        self.assertIn("### 2. A 0:40 / B 1:40 (not judged", md)
+        self.assertNotIn("hello there", md)
+        self.assertIn("- B 1:22 (A 0:22): invented sentence", md)
+
+    def test_without_a_judge_the_file_says_overlap_is_all_it_has(self):
+        md = N.render_disagreements(_windows(), self.SYNC, "a.m4a", "b.m4a")
+        self.assertIn("Not judged on meaning", md)
+        self.assertIn("### 1. A 0:40", md)
+
+
+class TestLoudness(unittest.TestCase):
+    def test_parse_volumedetect(self):
+        err = ("[Parsed_volumedetect_0 @ 0x600001] n_samples: 115200\n"
+               "[Parsed_volumedetect_0 @ 0x600001] mean_volume: -52.3 dB\n"
+               "[Parsed_volumedetect_0 @ 0x600001] max_volume: -20.1 dB\n")
+        self.assertEqual(N.parse_mean_volume(err), -52.3)
+        self.assertIsNone(N.parse_mean_volume("mean_volume: -inf dB"))
+        self.assertIsNone(N.parse_mean_volume("no such file"))
+
+    def test_the_second_must_be_measurably_louder_to_take_over(self):
+        self.assertEqual(N.louder(-56.0, -52.0), "second")
+        self.assertEqual(N.louder(-52.0, -56.0), "first")
+        self.assertEqual(N.louder(-52.0, -51.5), "first")
+        self.assertEqual(N.louder(None, -20.0), "first")
+        self.assertEqual(N.louder(-20.0, None), "first")
+
+    def test_pick_primary(self):
+        a, b = Path("a.m4a"), Path("b.m4a")
+        with contextlib.redirect_stdout(io.StringIO()):
+            with mock.patch.object(N, "mean_volume", side_effect=[-56.0, -52.0]):
+                self.assertEqual(N.pick_primary(a, b, "louder", False), (b, a))
+            with mock.patch.object(N, "mean_volume") as mv:
+                self.assertEqual(N.pick_primary(a, b, "first", False), (a, b))
+                self.assertEqual(N.pick_primary(a, b, "second", False), (b, a))
+                # a transcript was written for the first file: it stays primary
+                self.assertEqual(N.pick_primary(a, b, "louder", True), (a, b))
+                self.assertEqual(N.pick_primary(a, b, "second", True), (a, b))
+                mv.assert_not_called()
+
+
+class TestRunWithASecondRecording(unittest.TestCase):
+    """`run --second`: the primary's outputs are untouched, and the merged
+    transcript and the ranked disagreements are written beside them."""
+
+    def _run(self, tmp, b_words, extra=(), a_words=None, llm=None):
+        a_words = _talk(120) if a_words is None else a_words
+        pipe = N.Pipeline(audio="/memos/phone-a.m4a", words=a_words,
+                          turns=[N.Turn("SPEAKER_00", 0, 10**6)])
+        (tmp / "a").mkdir()
+        (tmp / "a" / "pipeline.json").write_text(pipe.to_json())
+        (tmp / "phone-b.json").write_text(
+            N.Pipeline(audio="/memos/phone-b.m4a", words=b_words).to_json())
+        (tmp / "c.json").write_text("{}")
+        args = N.build_parser().parse_args([
+            "run", "--from-json", str(tmp / "a" / "pipeline.json"),
+            "--second", str(tmp / "phone-b.json"), "--config", str(tmp / "c.json"),
+            "--out-dir", str(tmp / "out"), "--no-notes", "--language", "en",
+            *extra])
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(N, "llm", side_effect=llm) as m, \
+                contextlib.redirect_stdout(out), redirect_stderr(err):
+            args.func(args)
+        return m, out.getvalue(), err.getvalue()
+
+    def test_merges_judges_and_writes_the_three_files(self):
+        a = _talk(120)
+        b = [N.Word("Sunday" if i == 45 else w.text, w.start, w.end)
+             for i, w in enumerate(_shift(a, 30.0))]
+        def judge(messages, system, **kw):
+            self.assertIs(system, N.JUDGE_SYSTEM)
+            return json.dumps([
+                {"id": x["id"], "note": "w45 vs Sunday" if "Sunday" in x["b"] else "",
+                 "verdict": "differ" if "Sunday" in x["b"] else "same"}
+                for x in json.loads(messages[0]["content"])])
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            m, out, err = self._run(tmp, b, llm=judge)
+            self.assertEqual(m.call_count, 1)
+            self.assertIn("offset 30.0s", out)
+            self.assertIn("transcript_merged.md", out)
+            merged = (tmp / "out" / "transcript_merged.md").read_text()
+            self.assertIn("A = phone-a.m4a (the default), B = phone-b.json", merged)
+            self.assertIn("> B heard (w45 vs Sunday):", merged)
+            self.assertEqual(merged.count("> B heard"), 1)
+            dis = (tmp / "out" / "disagreements.md").read_text()
+            self.assertIn("5 same, 1 differ, 0 unclear", dis)
+            self.assertIn("- A: w45\n  B: Sunday", dis)
+            saved = json.loads((tmp / "out" / "merge.json").read_text())
+            self.assertAlmostEqual(saved["sync"]["offset"], 30.0)
+            self.assertEqual(len(saved["windows"]), 6)
+            # the primary's own transcript is what it would be without --second
+            self.assertEqual((tmp / "out" / "transcript_named.md").read_text(),
+                             N.render_named(N.merge(a, [N.Turn("SPEAKER_00", 0, 1)])))
+
+    def test_no_judge_makes_no_llm_call(self):
+        a = _talk(120)
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            m, _, _ = self._run(tmp, _shift(a, 30.0), extra=["--no-judge"])
+            m.assert_not_called()
+            self.assertIn("Not judged on meaning",
+                          (tmp / "out" / "disagreements.md").read_text())
+
+    def test_a_different_conversation_is_not_merged_and_the_run_still_finishes(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            m, out, err = self._run(tmp, _talk(120, prefix="x"))
+            m.assert_not_called()
+            self.assertIn("do not look like the same conversation", err)
+            self.assertNotIn("transcript_merged.md", out)
+            self.assertFalse((tmp / "out" / "transcript_merged.md").exists())
+            self.assertFalse((tmp / "out" / "disagreements.md").exists())
+            self.assertTrue((tmp / "out" / "transcript_named.md").exists())
+
+    def test_a_missing_second_file_stops_before_any_work(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            (tmp / "c.json").write_text("{}")
+            args = N.build_parser().parse_args([
+                "run", "a.m4a", "--second", str(tmp / "nope.m4a"),
+                "--config", str(tmp / "c.json"), "--out-dir", str(tmp / "out")])
+            with mock.patch.object(N, "to_wav16k") as wav, \
+                    self.assertRaises(SystemExit) as cm:
+                args.func(args)
+            self.assertIn("--second file not found", str(cm.exception))
+            wav.assert_not_called()
+
+    def test_primary_second_is_refused_when_one_side_is_a_json(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with self.assertRaises(SystemExit) as cm, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self._run(tmp, _talk(20), extra=["--primary", "second"])
+            self.assertIn("swap the two", str(cm.exception))
+
+    def test_second_audio_is_transcribed_like_the_first_and_never_diarized(self):
+        a = _talk(120)
+        b = _shift(a, 12.0)
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            for name in ("quiet.m4a", "loud.m4a"):
+                (tmp / name).write_bytes(b"")
+            (tmp / "c.json").write_text("{}")
+            args = N.build_parser().parse_args([
+                "run", str(tmp / "quiet.m4a"), "--second", str(tmp / "loud.m4a"),
+                "--config", str(tmp / "c.json"), "--out-dir", str(tmp / "out"),
+                "--no-notes", "--no-judge", "--language", "en"])
+            diarize = mock.Mock(return_value='[{"speaker": 0, "start": 0, "end": 99}]')
+            out = io.StringIO()
+            with mock.patch.object(N, "need"), \
+                    mock.patch.object(N, "mean_volume", side_effect=[-56.0, -52.0]), \
+                    mock.patch.object(N, "to_wav16k", side_effect=lambda s, o: o) as wav, \
+                    mock.patch.object(N, "_wav_duration", return_value=70.0), \
+                    mock.patch.object(N, "run_diarize", diarize), \
+                    mock.patch.object(N, "transcribe_speech",
+                                      side_effect=[b, a]) as asr, \
+                    mock.patch.object(N, "llm") as llm, \
+                    contextlib.redirect_stdout(out):
+                args.func(args)
+            llm.assert_not_called()
+            # the louder file became the primary: converted first, diarized once
+            self.assertEqual([c.args[0].name for c in wav.call_args_list],
+                             ["loud.m4a", "quiet.m4a"])
+            self.assertEqual([c.args[1].name for c in wav.call_args_list],
+                             ["audio.wav", "audio2.wav"])
+            self.assertEqual(diarize.call_count, 1)
+            self.assertEqual(asr.call_count, 2)
+            self.assertIn("loud.m4a is the default", out.getvalue())
+            saved = json.loads((tmp / "out" / "merge.json").read_text())
+            self.assertTrue(saved["primary"].endswith("loud.m4a"))
+            self.assertEqual(saved["second"], "quiet.m4a")
+            self.assertAlmostEqual(saved["sync"]["offset"], -12.0)
+            second = N.Pipeline.from_json((tmp / "out" / "second.json").read_text())
+            self.assertEqual(len(second.words), 120)
 
 
 if __name__ == "__main__":
