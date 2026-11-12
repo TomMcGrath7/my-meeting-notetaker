@@ -1318,6 +1318,38 @@ class TestSyncRecordings(unittest.TestCase):
         self.assertAlmostEqual(sync.drift, drift, places=7)
         self.assertAlmostEqual(sync.offset, 100.0, places=2)
 
+    def test_real_speech_repeats_words_and_still_syncs(self):
+        # The tests above use all-distinct words. Real talk repeats "the",
+        # "and", "I" thousands of times, which is what difflib's autojunk
+        # heuristic keys on past 200 words. Two hours of a Zipf vocabulary,
+        # B starting 17 min earlier with talk A never heard, 1 word in 10
+        # dropped and 1 in 7 misheard, and the case's own numbers
+        # (docs/two-recordings.md: 1015.5s, 0.13s/hour).
+        import random
+        rnd = random.Random(7)
+        vocab = [f"v{i}" for i in range(3000)]
+        weights = [1 / (i + 1) for i in range(3000)]
+        a, t = [], 0.0
+        for tok in rnd.choices(vocab, weights=weights, k=15000):
+            a.append(N.Word(tok, t, t + 0.3))
+            t += 0.45 + (rnd.random() * 3 if rnd.random() < 0.05 else 0.0)
+        drift = 0.13 / 3600
+        b = [N.Word(rnd.choice(vocab), x * 0.45, x * 0.45 + 0.3)
+             for x in range(2000)]
+        for w in _shift(a, 1015.5, drift):
+            r = rnd.random()
+            if r >= 0.1:
+                b.append(N.Word(rnd.choice(vocab) if r < 0.25 else w.text,
+                                w.start, w.end))
+        sync = N.sync_recordings(a, b)
+        self.assertIsNotNone(sync)
+        self.assertAlmostEqual(sync.offset, 1015.5, places=1)
+        self.assertAlmostEqual(sync.drift * 3600, 0.13, places=2)
+        self.assertGreater(sync.agreeing, 500)
+        # an hour in, B's clock maps back onto A's to well under a word
+        self.assertAlmostEqual(sync.to_primary(3600 + 1015.5 + 0.13), 3600.0,
+                               places=2)
+
     def test_a_short_pair_gets_no_drift_fit(self):
         a = _talk(200)
         b = [N.Word("zzz" if i % 30 == 0 else w.text, w.start, w.end)
