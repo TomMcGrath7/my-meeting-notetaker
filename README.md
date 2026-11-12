@@ -131,7 +131,7 @@ cp config.example.yaml config.yaml && $EDITOR config.yaml
 # 2. full run
 python3 notetaker.py run meeting.m4a --config config.yaml --out-dir ./out
 
-# noisy call, end-to-end Neural-Engine diarizer (default), Dutch hint:
+# noisy call, default (pyannote) diarizer, Dutch hint:
 python3 notetaker.py run call.m4a --denoise --language nl
 
 # iterate on prompts cheaply — skip all audio stages, reuse intermediates:
