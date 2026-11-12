@@ -66,6 +66,7 @@ final class PipelineModel: ObservableObject {
     static let shared = PipelineModel()
 
     @Published var audioURL: URL?
+    @Published var secondURL: URL?                    // optional: the same meeting, recorded on another device
     @Published var log: String = ""
     @Published var isRunning = false
     @Published var lastOutDir: String?
@@ -102,6 +103,11 @@ final class PipelineModel: ObservableObject {
     func accept(_ url: URL) {
         audioURL = url
         appendLine("• selected \(url.lastPathComponent)")
+    }
+
+    func acceptSecond(_ url: URL) {
+        secondURL = url
+        appendLine("• second recording: \(url.lastPathComponent)")
     }
 
     // MARK: config.yaml <-> UI
@@ -190,6 +196,10 @@ final class PipelineModel: ObservableObject {
         } else if let t = transcriptURL {
             args += ["--transcript", t.path]
         }
+
+        // A second recording of the same meeting: notetaker lines the two up on
+        // their words and also writes transcript_merged.md + disagreements.md.
+        if let second = secondURL { args += ["--second", second.path] }
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/bash")
@@ -442,10 +452,12 @@ struct ContentView: View {
     @ObservedObject var m = PipelineModel.shared
     @StateObject private var voiceNote = VoiceNote()
     @State private var dropHighlight = false
+    @State private var secondHighlight = false
 
     var body: some View {
         VStack(spacing: 12) {
             dropZone
+            secondRow
             roster
             controls
             transcriptRow
@@ -453,7 +465,7 @@ struct ContentView: View {
             statusBar
         }
         .padding(16)
-        .frame(minWidth: 580, minHeight: 740)
+        .frame(minWidth: 580, minHeight: 780)
     }
 
     private var dropZone: some View {
@@ -482,6 +494,33 @@ struct ContentView: View {
         .onDrop(of: [.fileURL, .audio, .item], isTargeted: $dropHighlight) { providers in
             handleDrop(providers)
         }
+    }
+
+    /// The second drop slot: the same meeting recorded on another device.
+    private var secondRow: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "waveform.badge.plus").foregroundColor(.secondary)
+            Text(m.secondURL.map { "Second recording: \($0.lastPathComponent)" }
+                 ?? "Second recording of the same meeting (optional): drop it here")
+                .font(.caption).foregroundColor(.secondary)
+                .lineLimit(1).truncationMode(.middle)
+            Spacer()
+            Button("Choose…") { pickFile(second: true) }
+            if m.secondURL != nil {
+                Button("Clear") { m.secondURL = nil }
+            }
+        }
+        .padding(.horizontal, 10).padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(style: StrokeStyle(lineWidth: 1, dash: [5]))
+                .foregroundColor(secondHighlight ? .accentColor : .secondary.opacity(0.4))
+        )
+        .onDrop(of: [.fileURL, .audio, .item], isTargeted: $secondHighlight) { providers in
+            handleDrop(providers, second: true)
+        }
+        .help("The same meeting recorded on another phone or laptop. The louder recording becomes the transcript; the other fills its gaps, and disagreements.md lists where the two differ.")
+        .disabled(m.isRunning)
     }
 
     private var roster: some View {
@@ -628,8 +667,11 @@ struct ContentView: View {
 
     // MARK: drop / pick
 
-    private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
+    private func handleDrop(_ providers: [NSItemProvider], second: Bool = false) -> Bool {
         guard let p = providers.first else { return false }
+        let accept: @MainActor (URL) -> Void = { url in
+            if second { PipelineModel.shared.acceptSecond(url) } else { PipelineModel.shared.accept(url) }
+        }
         // Prefer a real file representation: this materializes file *promises*
         // (how Voice Memos vends a recording) into a temp file, not just plain
         // file-URL drags. Pick an audio-conforming type id, else a file-url.
@@ -638,15 +680,15 @@ struct ContentView: View {
                   ?? ids.first { $0 == UTType.fileURL.identifier }
         if let id = fileId {
             p.loadFileRepresentation(forTypeIdentifier: id) { url, _ in
-                guard let url, let stable = Self.intoInbox(url) else { return }
-                Task { @MainActor in PipelineModel.shared.accept(stable) }
+                guard let url, let stable = Self.intoInbox(url, second: second) else { return }
+                Task { @MainActor in accept(stable) }
             }
             return true
         }
         if p.canLoadObject(ofClass: URL.self) {       // Finder file drag
             _ = p.loadObject(ofClass: URL.self) { url, _ in
                 guard let url, url.isFileURL else { return }
-                Task { @MainActor in PipelineModel.shared.accept(url) }
+                Task { @MainActor in accept(url) }
             }
             return true
         }
@@ -654,9 +696,12 @@ struct ContentView: View {
     }
 
     /// The URL from loadFileRepresentation is temporary and deleted once the
-    /// handler returns, so copy it somewhere stable before using it.
-    private static func intoInbox(_ src: URL) -> URL? {
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("DropMemo", isDirectory: true)
+    /// handler returns, so copy it somewhere stable before using it. The second
+    /// recording gets its own folder: two phones both call a memo "New Recording",
+    /// and one copy must not overwrite the other.
+    private static func intoInbox(_ src: URL, second: Bool = false) -> URL? {
+        var dir = FileManager.default.temporaryDirectory.appendingPathComponent("DropMemo", isDirectory: true)
+        if second { dir = dir.appendingPathComponent("second", isDirectory: true) }
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let dest = dir.appendingPathComponent(src.lastPathComponent)
         try? FileManager.default.removeItem(at: dest)
@@ -664,13 +709,13 @@ struct ContentView: View {
         catch { return nil }
     }
 
-    private func pickFile() {
+    private func pickFile(second: Bool = false) {
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
         panel.allowedContentTypes = [.audio, .mpeg4Audio, .wav, .mp3]
         if panel.runModal() == .OK, let url = panel.url {
-            m.accept(url)
+            if second { m.acceptSecond(url) } else { m.accept(url) }
         }
     }
 

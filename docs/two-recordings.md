@@ -63,3 +63,16 @@ A second drop slot. Word-based alignment (step 1). Volume normalisation before A
 transcript with the louder phone as the default. A ranked list of the windows where the two
 disagree most, each shown phrase by phrase, plus a place to enter names and corrections that
 feed a fresh translation pass.
+
+## What is built (`run --second`, and DropMemo's second slot)
+
+Steps 1 to 4: word-based alignment with a drift fit, the shared timeline cut at pauses, the
+louder recording as the default, and agreement judged on meaning by an LLM (its own call, 45
+windows a batch, every id checked), not folded into translation. The outputs are
+`transcript_merged.md` and the ranked, phrase-by-phrase `disagreements.md`. See the README.
+
+Not built: volume normalisation before ASR (the pipeline's own measurement, in the comment
+above `VAD_CHUNK_SECONDS`, was that it did not improve the text, which disagrees with the
+trap above and wants one more look); translation with listener context (step 5); extra
+readings and the reconstruction pass (steps 6 and 7); the names-and-corrections box. Notes
+and `transcript_en.md` still come from the default recording alone.

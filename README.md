@@ -26,6 +26,12 @@ audio.m4a
   ├─ LLM relabel       → SPEAKER_00 → "Tom", flag low-confidence  [text only]
   ├─ LLM translate     → English transcript, if the memo isn't English [text only]
   └─ LLM notes         → summary / decisions / actions            [text only]
+
+--second other.m4a     (the same meeting, recorded on another device)
+  ├─ speech vad/align  → its words; no diarization
+  ├─ line up on words  → offset + clock drift   [local, no model]
+  ├─ shared windows    → the two paired, cut at pauses [local, no model]
+  └─ LLM judge         → where the two disagree, on meaning       [text only]
 ```
 
 The split is deliberate: the **acoustic** layer (`speech`) decides *when* the
@@ -186,9 +192,50 @@ python3 notetaker.py align-report out-20260702-001651/pipeline.json --align-chun
 > records the root cause and, importantly, the plausible-but-wrong fixes we
 > already ruled out, so they don't get retried.
 
-> Recorded the same meeting on two devices? [`docs/two-recordings.md`](docs/two-recordings.md)
-> is how two recordings were aligned and merged by hand, and the traps (`--context` leaking
-> into the transcript, ASR on un-normalised quiet audio).
+### Two recordings of the same meeting
+
+Recorded the meeting on two devices (two phones, a phone and a laptop)? Give
+the second one with `--second`:
+
+```bash
+python3 notetaker.py run phone-a.m4a --second phone-b.m4a --config config.yaml
+
+# both already processed on their own: no audio work at all
+python3 notetaker.py run --from-json out-a/pipeline.json --second out-b/pipeline.json
+```
+
+- **The louder recording is the default** (`--primary louder`, measured with
+  ffmpeg): it gets the diarization, the speaker names, `transcript_named.md`
+  and the notes, exactly as a run without `--second` would. `--primary first`
+  or `second` overrides. With `--transcript`, or when either side is a
+  `pipeline.json`, the first is the default.
+- **The other recording is only transcribed**, then lined up with the first
+  **on the words, not the audio**: runs of 5 matching words (case, accents and
+  punctuation ignored) give the offset between the two clocks, and across 10
+  minutes or more the clock drift. The recordings need not start together. If
+  too few runs agree, the two are not the same conversation: the run says so,
+  merges nothing, and still finishes with the first recording's outputs.
+- **One shared timeline** is cut at pauses (over 1.2s once a window is 8s long,
+  and at 35s regardless) and the two are paired window by window.
+- **An LLM judges each window on meaning** (same / differ / unclear), 45
+  windows a call, because word overlap is a poor test: it is low even where
+  both recordings say the same thing. `--no-judge` skips the call and ranks by
+  word overlap alone.
+
+It writes three more files: `transcript_merged.md` (the default recording's
+text, the other filling the stretches it has nothing for, and a small
+"B heard:" line only where the judge said the two differ), `disagreements.md`
+(the differing windows ranked worst first, each phrase by phrase, with the
+time in both recordings) and `merge.json`. A stretch only the other recording
+heard while the default one was running is marked unconfirmed: a quiet
+recording invents fluent text where it cannot hear.
+
+Not built: the notes and `transcript_en.md` still come from the default
+recording alone, the audio is not volume-normalised before ASR, and there is no
+second-opinion transcription of the disputed passages.
+[`docs/two-recordings.md`](docs/two-recordings.md) is the method this follows,
+worked by hand, and has the traps (`--context` leaking into the transcript, ASR
+on un-normalised quiet audio).
 
 If you already have a transcript (e.g. exported from Voice Memos), hand it over
 and notetaker **force-aligns** it instead of transcribing — better text, and it
@@ -206,6 +253,9 @@ python3 notetaker.py run meeting.m4a --transcript voice-memo.txt
 | `transcript_en.md` | the same transcript in English, when the memo is in another language (`--no-translate` to skip; nothing is written for an English memo or `--language en`) |
 | `notes.md` | summary, key decisions, action items, open questions |
 | `pipeline.json` | every intermediate — re-run the LLM steps without re-processing audio |
+| `transcript_merged.md` | with `--second`: both recordings as one transcript, times on the default recording's clock |
+| `disagreements.md` | with `--second`: where the two recordings disagree, ranked, phrase by phrase |
+| `merge.json`, `second.json` | with `--second`: the offset, drift and every window; and the second recording's words (reuse as `--second out/second.json`) |
 
 ## Tests
 
@@ -227,8 +277,8 @@ Stdlib `unittest` only (no extra deps), no audio/model/network — runs in
 milliseconds. Covers the pure functions that actually break things: the
 `diarize`/`align` output parsers (pinned against captured real `speech` output
 in `tests/fixtures/`, so a format drift fails loudly instead of silently
-corrupting output), word→speaker attribution (`merge`), and the alignment
-chunking + collapse guard. If you upgrade speech-swift and `notetaker.py check`
+corrupting output), word→speaker attribution (`merge`), the alignment
+chunking + collapse guard, and the two-recordings merge (`--second`). If you upgrade speech-swift and `notetaker.py check`
 shows a new output format, re-capture the fixtures.
 
 ## Going fully offline
@@ -387,7 +437,10 @@ optionally **attach a transcript** (a Voice Memos export, force-aligned to
 the audio; only one in the memo's own language, since Voice Memos may give an
 English transcript of a Dutch or Spanish memo, and aligning that to the audio
 puts English words on the wrong speech. Leave it empty and the memo is
-transcribed, with `transcript_en.md` written for you), watch the pipeline stream live, and
+transcribed, with `transcript_en.md` written for you), optionally drop a
+**second recording of the same meeting** on the slot under the drop zone (see
+[Two recordings of the same meeting](#two-recordings-of-the-same-meeting)),
+watch the pipeline stream live, and
 **Stop** (⌘.) any time. On completion it reveals the out-dir and opens
 `notes.md`. Build it without Xcode:
 

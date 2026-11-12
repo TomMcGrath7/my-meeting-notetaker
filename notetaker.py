@@ -13,6 +13,8 @@ Pipeline (each stage runs alone, so peak RAM ~= the single biggest model):
       └─ LLM: map SPEAKER_xx -> real names, flag low-confidence  [text only]
       └─ LLM: English transcript, if the memo isn't English      [text only]
       └─ LLM: meeting notes (summary / decisions / actions)      [text only]
+      └─ (--second) a second recording of the same meeting, lined up on the
+         words and merged; LLM: where the two disagree           [text only]
 
 Only TEXT ever leaves the device (the LLM steps). Audio + diarization +
 ASR are 100% local via the `speech` binary (github.com/soniqo/speech-swift).
@@ -1333,6 +1335,415 @@ def render_english(segs: list[Segment], english: list[str]) -> str:
     return head + render_named([replace(s, text=t) for s, t in zip(segs, english)])
 
 # --------------------------------------------------------------------------- #
+# two recordings of one conversation  (--second; docs/two-recordings.md)
+# --------------------------------------------------------------------------- #
+
+# The same meeting recorded on two devices. The method is the one that worked
+# by hand (docs/two-recordings.md): line the two up on their WORDS, not their
+# audio; cut one shared timeline at pauses; take the louder recording as the
+# default; and let an LLM judge, on meaning, where the two disagree, because
+# word overlap sat around 0.3 even where both plainly said the same thing.
+#
+# The numbers below are that write-up's (runs of 5 words, a pause over 1.2s
+# once a window is 8s long, a hard cut at 35s, 45 windows a call) except the
+# four marked "a choice", which it does not give.
+SYNC_MIN_RUN = 5          # a run of matching words this long gives an offset
+SYNC_TOLERANCE = 3.0      # a choice: runs within this of the median agree
+SYNC_MIN_RUNS = 3         # a choice: fewer agreeing runs is not a match
+DRIFT_MIN_SPAN = 600.0    # a choice: fit clock drift only across 10+ minutes
+WINDOW_PAUSE = 1.2
+WINDOW_MIN = 8.0
+WINDOW_MAX = 35.0
+LOUDER_MARGIN_DB = 1.0    # a choice: closer than this, the first file stays
+JUDGE_BATCH = 45
+DISAGREE_TOP = 40         # without a judge, the list is every window: cap it
+
+_MEAN_VOLUME_RE = re.compile(r"mean_volume:\s*(-?\d+(?:\.\d+)?)\s*dB")
+
+def parse_mean_volume(stderr: str) -> float | None:
+    """The mean level from ffmpeg's volumedetect ("mean_volume: -52.3 dB").
+    None for silence ("-inf") or output without the line."""
+    m = _MEAN_VOLUME_RE.search(stderr)
+    return float(m.group(1)) if m else None
+
+def mean_volume(src: Path) -> float | None:
+    need("ffmpeg")
+    proc = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-nostats", "-i", str(src), "-vn",
+         "-af", "volumedetect", "-f", "null", "-"],
+        capture_output=True, text=True)
+    return parse_mean_volume(proc.stderr or "")
+
+def louder(first_db: float | None, second_db: float | None) -> str:
+    """Which recording is the default: "second" only when it is measurably
+    louder. An unmeasured level never moves the default off the first file."""
+    if first_db is None or second_db is None:
+        return "first"
+    return "second" if second_db - first_db > LOUDER_MARGIN_DB else "first"
+
+def _word_key(text: str) -> str:
+    """A word as the matcher sees it: lower-cased, accents and punctuation
+    stripped. Unlike _bare it keeps digits ("2024" is a word)."""
+    import unicodedata
+    s = unicodedata.normalize("NFKD", text.lower())
+    return "".join(c for c in s if c.isalnum())
+
+def _keyed(words: list[Word]) -> list[tuple[str, Word]]:
+    return [(k, w) for w in words for k in [_word_key(w.text)] if k]
+
+@dataclass
+class Sync:
+    """How the second recording's clock maps onto the primary's:
+    t_second = t_primary + offset + drift * t_primary. A positive offset means
+    the second recording started earlier."""
+    offset: float
+    drift: float       # seconds gained per second of recording
+    runs: int          # matching runs of SYNC_MIN_RUN words
+    agreeing: int      # of those, how many sit within SYNC_TOLERANCE
+
+    def to_primary(self, t: float) -> float:
+        return (t - self.offset) / (1.0 + self.drift)
+
+    def to_second(self, t: float) -> float:
+        return t + self.offset + self.drift * t
+
+def sync_recordings(a: list[Word], b: list[Word]) -> Sync | None:
+    """Line two transcripts of one conversation up on their words. None when
+    they do not look like the same conversation: fewer than SYNC_MIN_RUNS
+    matching runs of SYNC_MIN_RUN words agree on an offset, or most runs
+    disagree with it."""
+    import difflib
+    ka, kb = _keyed(a), _keyed(b)
+    sm = difflib.SequenceMatcher(None, [k for k, _ in ka], [k for k, _ in kb])
+    points: list[tuple[float, float]] = []      # (primary time, offset there)
+    for i, j, n in sm.get_matching_blocks():
+        # A long block counts once per SYNC_MIN_RUN words: two clean
+        # transcripts match as ONE block, and that is the best case, not one
+        # weak run. It also gives the drift fit points along the block.
+        for x in range(0, n - SYNC_MIN_RUN + 1, SYNC_MIN_RUN):
+            diffs = sorted(kb[j + x + y][1].start - ka[i + x + y][1].start
+                           for y in range(SYNC_MIN_RUN))
+            points.append((ka[i + x][1].start, diffs[SYNC_MIN_RUN // 2]))
+    if not points:
+        return None
+    offsets = sorted(o for _, o in points)
+    mid = offsets[len(offsets) // 2]
+    good = [p for p in points if abs(p[1] - mid) <= SYNC_TOLERANCE]
+    if len(good) < SYNC_MIN_RUNS or len(good) * 2 < len(points):
+        return None
+    offset, drift = mid, 0.0
+    ts = [t for t, _ in good]
+    if max(ts) - min(ts) >= DRIFT_MIN_SPAN:
+        mt = sum(ts) / len(ts)
+        mo = sum(o for _, o in good) / len(good)
+        var = sum((t - mt) ** 2 for t in ts)
+        drift = sum((t - mt) * (o - mo) for t, o in good) / var
+        offset = mo - drift * mt
+    return Sync(offset=offset, drift=drift, runs=len(points), agreeing=len(good))
+
+def onto_primary(words: list[Word], sync: Sync) -> list[Word]:
+    return [Word(w.text, sync.to_primary(w.start), sync.to_primary(w.end))
+            for w in words]
+
+@dataclass
+class MergeWindow:
+    """One stretch of the shared timeline (primary's clock) and what each
+    recording has in it. `a` is the primary."""
+    start: float
+    end: float
+    a: str = ""
+    b: str = ""
+    a_at: float | None = None      # middle of the primary's first word here
+    overlap: float | None = None   # word-overlap ratio, when both have text
+    verdict: str = ""              # same | differ | unclear, from the judge
+    note: str = ""
+
+def _join_words(words: list[Word]) -> str:
+    return re.sub(r"\s+([,.;:!?])", r"\1", " ".join(w.text for w in words)).strip()
+
+def _overlap(a: str, b: str) -> float:
+    import difflib
+    return difflib.SequenceMatcher(
+        None, [k for k in map(_word_key, a.split()) if k],
+        [k for k in map(_word_key, b.split()) if k], autojunk=False).ratio()
+
+def merge_windows(a: list[Word], b: list[Word]) -> list[MergeWindow]:
+    """Cut the shared timeline at pauses and pair the two recordings window by
+    window. `b` must already be on the primary's clock (onto_primary). A window
+    ends at a pause over WINDOW_PAUSE in BOTH recordings once it is WINDOW_MIN
+    long, and at WINDOW_MAX regardless."""
+    tagged = sorted([(w.start, 0, w) for w in a] + [(w.start, 1, w) for w in b],
+                    key=lambda x: (x[0], x[1]))
+    out: list[MergeWindow] = []
+    sides: list[list[Word]] = [[], []]
+    win_start = last_end = 0.0
+
+    def close():
+        wa, wb = sides
+        w = MergeWindow(start=win_start, end=last_end,
+                        a=_join_words(wa), b=_join_words(wb),
+                        a_at=(wa[0].start + wa[0].end) / 2.0 if wa else None)
+        if w.a and w.b:
+            w.overlap = _overlap(w.a, w.b)
+        out.append(w)
+
+    for start, side, w in tagged:
+        if sides[0] or sides[1]:
+            paused = (start - last_end > WINDOW_PAUSE
+                      and last_end - win_start >= WINDOW_MIN)
+            if paused or start - win_start >= WINDOW_MAX:
+                close()
+                sides = [[], []]
+        if not (sides[0] or sides[1]):
+            win_start, last_end = start, max(start, w.end)
+        sides[side].append(w)
+        last_end = max(last_end, w.end)
+    if sides[0] or sides[1]:
+        close()
+    return out
+
+JUDGE_SYSTEM = """Two devices recorded the same conversation, and each recording was
+transcribed on its own by speech-to-text. You get stretches of it as a JSON array of
+{"id": n, "a": "...", "b": "..."}, where "a" and "b" are the two transcripts of the
+same moment.
+
+For each id, decide whether a and b say the same thing:
+- "same": the same meaning. Spelling, punctuation, fillers, a misheard word that does
+  not change what was said, and a few words missing at either edge (the stretches are
+  cut by time, not by sentence) are NOT differences.
+- "differ": they say different things: a different name, number, word or claim, or one
+  has a sentence the other lacks.
+- "unclear": one or both are too garbled to tell.
+
+Judge only what is written. Do not correct, complete or translate either transcript.
+
+Respond with ONLY a JSON array, one object per id, no prose, no markdown fences:
+[{"id": 0, "verdict": "same", "note": ""},
+ {"id": 1, "verdict": "differ", "note": "what differs, in a few words"}]"""
+
+_VERDICTS = ("same", "differ", "unclear")
+
+def judge_windows(windows: list[MergeWindow], **llm_kw) -> int:
+    """Ask the LLM, JUDGE_BATCH windows a call, whether the two recordings say
+    the same thing in each window that both have text for. Fills verdict and
+    note in place. Every batch is checked for every id; returns how many
+    windows came back without a usable verdict (they stay unjudged)."""
+    ids = [i for i, w in enumerate(windows) if w.a and w.b]
+    missing = 0
+    for at in range(0, len(ids), JUDGE_BATCH):
+        batch = ids[at:at + JUDGE_BATCH]
+        user = json.dumps([{"id": i, "a": windows[i].a, "b": windows[i].b}
+                           for i in batch], ensure_ascii=False)
+        out = llm([{"role": "user", "content": user}], JUDGE_SYSTEM,
+                  max_tokens=4000, **llm_kw)
+        try:
+            data = _extract_json(out)
+        except json.JSONDecodeError:
+            data = []
+        if isinstance(data, dict):
+            data = _first(data, "results", "verdicts", "windows", default=[data])
+        got = set()
+        for item in data if isinstance(data, list) else []:
+            if not isinstance(item, dict):
+                continue
+            i, verdict = item.get("id"), str(item.get("verdict", "")).strip().lower()
+            if isinstance(i, int) and i in batch and verdict in _VERDICTS:
+                windows[i].verdict = verdict
+                windows[i].note = str(item.get("note") or "").strip()
+                got.add(i)
+        missing += len(batch) - len(got)
+    if missing:
+        print(f"warning: {missing} of {len(ids)} windows came back from the LLM "
+              f"without a verdict; they are ranked by word overlap instead.",
+              file=sys.stderr)
+    return missing
+
+def rank_disagreements(windows: list[MergeWindow]) -> list[MergeWindow]:
+    """The windows where the two recordings disagree, worst first. With a
+    judge: every window it did not call "same" ("differ", then the ones it
+    left unjudged, then "unclear"), least word overlap first within each.
+    Without one, word overlap is all there is, and since it is a poor test
+    (about 0.3 even in agreement) only the DISAGREE_TOP lowest are listed."""
+    both = [w for w in windows if w.a and w.b]
+    if any(w.verdict for w in both):
+        order = {"differ": 0, "": 1, "unclear": 2}
+        pool = [w for w in both if w.verdict != "same"]
+        return sorted(pool, key=lambda w: (order[w.verdict], w.overlap or 0.0))
+    return sorted(both, key=lambda w: w.overlap or 0.0)[:DISAGREE_TOP]
+
+def phrase_diff(a: str, b: str) -> list[tuple[str, str]]:
+    """The two texts phrase by phrase: [(a_phrase, b_phrase)], equal where both
+    recordings have the same words (compared without case, accents or
+    punctuation; the primary's spelling is shown), and "" on the side that
+    has nothing there."""
+    import difflib
+    wa = [w for w in a.split() if _word_key(w)]
+    wb = [w for w in b.split() if _word_key(w)]
+    sm = difflib.SequenceMatcher(None, [_word_key(w) for w in wa],
+                                 [_word_key(w) for w in wb], autojunk=False)
+    out = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        pa, pb = " ".join(wa[i1:i2]), " ".join(wb[j1:j2])
+        out.append((pa, pa) if tag == "equal" else (pa, pb))
+    return out
+
+def signed_hhmmss(t: float) -> str:
+    """hhmmss, for a time that may fall before the primary recording began."""
+    return hhmmss(t) if t > -1.0 else "-" + hhmmss(-t)
+
+def _primary_span(windows: list[MergeWindow]) -> tuple[float, float]:
+    has = [w for w in windows if w.a]
+    return (has[0].start, has[-1].end) if has else (0.0, 0.0)
+
+def render_merged(windows: list[MergeWindow], segs: list[Segment],
+                  a_name: str, b_name: str) -> str:
+    """One transcript from both recordings. The primary (A) is the text. B
+    fills the stretches A has nothing for, marked as B's, and is shown as a
+    small "B heard:" line only where the judge said the two differ: showing
+    both wherever they are not identical floods the page."""
+    turns = [Turn(s.speaker, s.start, s.end) for s in segs]
+    lo, hi = _primary_span(windows)
+    head = (f"_Merged from two recordings of one conversation. A = {a_name} "
+            f"(the default), B = {b_name}. Times are A's clock. Text is A's; "
+            f"\"B only\" is what A has nothing for, and \"B heard\" is where "
+            f"the two differ (see disagreements.md)._\n\n")
+    blocks: list[dict] = []
+    for w in windows:
+        if w.a:
+            key, text = _turn_for(w.a_at, turns) if turns else "A", w.a
+            b_line = w.b if w.verdict == "differ" else ""
+        else:
+            # B is the quieter recording, and a quiet recording invents fluent
+            # text where it cannot hear, so B alone inside A's span is doubtful.
+            inside = lo <= w.start <= hi
+            key = ("B only ⚠️ unconfirmed: A was recording and has nothing here"
+                   if inside else "B only")
+            text, b_line = w.b, ""
+        # Agreeing windows of one speaker run together. A window with a B line
+        # stands alone, so the line sits under exactly the text it answers.
+        if (blocks and blocks[-1]["key"] == key and not blocks[-1]["b"]
+                and not b_line):
+            blocks[-1]["text"] += " " + text
+            continue
+        why = f" ({w.note})" if w.note else ""
+        blocks.append({"key": key, "start": w.start, "text": text,
+                       "b": f"> B heard{why}: {b_line}\n" if b_line else ""})
+    return head + "\n".join(
+        f"**{k['key']}** ({signed_hhmmss(k['start'])})\n{k['text']}\n{k['b']}"
+        for k in blocks)
+
+def render_disagreements(windows: list[MergeWindow], sync: Sync,
+                         a_name: str, b_name: str) -> str:
+    both = [w for w in windows if w.a and w.b]
+    judged = any(w.verdict for w in both)
+    ranked = rank_disagreements(windows)
+    lo, hi = _primary_span(windows)
+    b_only = [w for w in windows if w.b and not w.a]
+    b_inside = [w for w in b_only if lo <= w.start <= hi]
+    a_only = sum(1 for w in windows if w.a and not w.b)
+    out = ["# Where the two recordings disagree", "",
+           f"A = {a_name} (the default), B = {b_name}.", "",
+           f"- Aligned on words: {sync.agreeing} of {sync.runs} matching runs "
+           f"agree on an offset of {sync.offset:.1f}s (positive: B started "
+           f"first), drift {sync.drift * 3600:.2f}s an hour.",
+           f"- {len(windows)} windows: {len(both)} heard by both, {a_only} by "
+           f"A only, {len(b_only)} by B only."]
+    if judged:
+        counts = {v: sum(1 for w in both if w.verdict == v) for v in _VERDICTS}
+        left = len(both) - sum(counts.values())
+        out.append(f"- Judged on meaning by the LLM: {counts['same']} same, "
+                   f"{counts['differ']} differ, {counts['unclear']} unclear"
+                   + (f", {left} not judged" if left else "") + ".")
+    else:
+        out.append(f"- Not judged on meaning (no LLM pass), so this is the "
+                   f"{len(ranked)} windows with the least word overlap. Word "
+                   f"overlap is a poor test: it is low even where both "
+                   f"recordings say the same thing.")
+    out += ["", "## Ranked, worst first", ""]
+    if not ranked:
+        out.append("Nothing to show: no window was judged different.\n")
+    for n, w in enumerate(ranked, 1):
+        label = w.verdict or "not judged"
+        note = f": {w.note}" if w.note else ""
+        out.append(f"### {n}. A {signed_hhmmss(w.start)} / B "
+                   f"{signed_hhmmss(sync.to_second(w.start))} ({label}{note}; "
+                   f"word overlap {w.overlap:.2f})")
+        out.append("")
+        for pa, pb in phrase_diff(w.a, w.b):
+            if pa == pb:
+                out.append(f"- both: {pa}")
+            else:
+                out.append(f"- A: {pa or '(nothing)'}")
+                out.append(f"  B: {pb or '(nothing)'}")
+        out.append("")
+    if b_inside:
+        out += ["## Heard by B only, while A was recording", "",
+                "A quiet recording invents fluent text where it cannot hear, "
+                "so check these against the audio before relying on them.", ""]
+        out += [f"- B {signed_hhmmss(sync.to_second(w.start))} (A "
+                f"{signed_hhmmss(w.start)}): {w.b}" for w in b_inside]
+        out.append("")
+    return "\n".join(out)
+
+def second_recording_words(src: Path, out_dir: Path, args) -> list[Word]:
+    """The second recording's words on its own clock. A pipeline.json from an
+    earlier run is read as it is; audio is transcribed the way the first
+    recording is (speech only, loops dropped). It is never diarized: speakers
+    come from the primary."""
+    if src.suffix.lower() == ".json":
+        return Pipeline.from_json(src.read_text()).words
+    need("speech")
+    wav = to_wav16k(src, out_dir / "audio2.wav")
+    if args.denoise:
+        wav = denoise(wav, out_dir / "audio2.clean.wav")
+    progress = lambda i, n, t: print(f"  chunk {i}/{n} … {t} words")
+    words = None
+    if not args.no_vad:
+        words = transcribe_speech(wav, args.model, args.language,
+                                  chunk_seconds=args.vad_chunk, progress=progress)
+    if words is None:
+        words = align_words(wav, args.model, args.language,
+                            chunk_seconds=args.align_chunk or ALIGN_CHUNK_SECONDS,
+                            progress=progress)
+    words, dropped = drop_loops(words)
+    if dropped:
+        print(f"  dropped {dropped} words of decoder loop (marked {LOOP_MARK})")
+    (out_dir / "second.json").write_text(
+        Pipeline(audio=str(src), words=words).to_json())
+    return words
+
+def merge_second(pipe: Pipeline, b_words: list[Word], b_name: str,
+                 out_dir: Path, judge: bool, **llm_kw) -> bool:
+    """Align the second recording to the primary and write
+    transcript_merged.md, disagreements.md and merge.json. False (and nothing
+    written) when the two cannot be lined up."""
+    a_name = Path(pipe.audio).name
+    sync = sync_recordings(pipe.words, b_words) if pipe.words and b_words else None
+    if sync is None:
+        print(f"warning: could not line {b_name} up with {a_name}: too few "
+              f"runs of {SYNC_MIN_RUN} matching words agree on an offset, so "
+              f"these do not look like the same conversation (or one "
+              f"transcript is empty). Nothing was merged; the outputs above "
+              f"are from {a_name} alone.", file=sys.stderr)
+        return False
+    print(f"  aligned on words: {sync.agreeing} of {sync.runs} matching runs "
+          f"agree; offset {sync.offset:.1f}s, drift {sync.drift * 3600:.2f}s/hour")
+    windows = merge_windows(pipe.words, onto_primary(b_words, sync))
+    both = sum(1 for w in windows if w.a and w.b)
+    print(f"  {len(windows)} windows, {both} heard by both recordings")
+    if judge and both:
+        print("• judging where the two recordings disagree via LLM…")
+        judge_windows(windows, **llm_kw)
+    (out_dir / "transcript_merged.md").write_text(
+        render_merged(windows, pipe.segments, a_name, b_name))
+    (out_dir / "disagreements.md").write_text(
+        render_disagreements(windows, sync, a_name, b_name))
+    (out_dir / "merge.json").write_text(json.dumps(
+        {"primary": pipe.audio, "second": b_name, "sync": asdict(sync),
+         "windows": [asdict(w) for w in windows]}, indent=2, ensure_ascii=False))
+    return True
+
+# --------------------------------------------------------------------------- #
 # commands
 # --------------------------------------------------------------------------- #
 
@@ -1424,6 +1835,24 @@ def resolve_num_ctx_max(flag, cfg: dict) -> int:
         return cap
     return DEFAULT_NUM_CTX_MAX
 
+def pick_primary(first: Path, second: Path, choice: str,
+                 has_transcript: bool) -> tuple[Path, Path]:
+    """(primary, other) for two audio files. The louder one is the default
+    (it was right far more often), unless --primary says otherwise. A provided
+    transcript belongs to the first file, so it pins the first as primary."""
+    if has_transcript and choice != "first":
+        print("• two recordings: the first is the default, since --transcript "
+              "is aligned to it")
+        return first, second
+    if choice == "louder":
+        a, b = mean_volume(first), mean_volume(second)
+        choice = louder(a, b)
+        level = lambda v: "unmeasured" if v is None else f"{v:.1f} dB"
+        print(f"• two recordings: {first.name} {level(a)}, {second.name} "
+              f"{level(b)} → {(first if choice == 'first' else second).name} "
+              f"is the default")
+    return (first, second) if choice == "first" else (second, first)
+
 def cmd_run(args):
     cfg = load_config(Path(args.config))
     roster = cfg.get("participants", [])
@@ -1434,11 +1863,24 @@ def cmd_run(args):
                   base_url=args.base_url or DEFAULT_BASE_URLS.get(args.llm_backend, ""),
                   num_ctx_max=resolve_num_ctx_max(args.num_ctx_max, cfg))
 
+    second = Path(args.second) if args.second else None
+    if second and not second.is_file():
+        sys.exit(f"error: --second file not found: {second}")
+    both_audio = bool(second and not args.from_json
+                      and second.suffix.lower() != ".json")
+    if second and args.primary == "second" and not both_audio:
+        sys.exit("error: --primary second needs two audio files. With a "
+                 "pipeline.json on either side, the first one is the default: "
+                 "swap the two instead.")
+
     if args.from_json:
         pipe = Pipeline.from_json(Path(args.from_json).read_text())
     else:
         need("speech")
         src = Path(args.file)
+        if both_audio:
+            src, second = pick_primary(src, second, args.primary,
+                                       bool(args.transcript))
         wav = to_wav16k(src, out_dir / "audio.wav")
         if args.denoise:
             print("• denoising…")
@@ -1508,6 +1950,14 @@ def cmd_run(args):
     if not pipe.segments:
         pipe.segments = merge(pipe.words, pipe.turns)
 
+    # The second recording's audio work happens here, before any LLM step, so
+    # the ASR model is never resident beside a local LLM.
+    b_words = None
+    if second:
+        print(f"• second recording: {second.name}")
+        b_words = second_recording_words(second, out_dir, args)
+        print(f"  {len(b_words)} words")
+
     if roster:
         print("• attributing speakers via LLM…")
         label_map, flagged = label_and_correct(pipe.segments, roster, context, **llm_kw)
@@ -1553,10 +2003,19 @@ def cmd_run(args):
         notes = make_notes(pipe.segments, context, **llm_kw)
         (out_dir / "notes.md").write_text(notes)
 
+    merged = False
+    if second:
+        print("• merging the two recordings…")
+        merged = merge_second(pipe, b_words, second.name, out_dir,
+                              judge=not args.no_judge, **llm_kw)
+
     print(f"\n✓ done → {out_dir}/")
     print("  transcript_named.md   speaker-attributed transcript")
     if english is not None:
         print("  transcript_en.md      the same transcript in English")
+    if merged:
+        print("  transcript_merged.md  both recordings as one transcript")
+        print("  disagreements.md      where the two recordings disagree, ranked")
     print("  pipeline.json         all intermediates (reuse with --from-json)")
     if not args.no_notes:
         print("  notes.md              summary / decisions / action items")
@@ -1615,6 +2074,21 @@ def build_parser() -> argparse.ArgumentParser:
                         "Voice Memos); force-align THIS text to the audio instead "
                         "of transcribing. Better text, but best-effort across "
                         "chunks since the source text is untimed.")
+    r.add_argument("--second",
+                   help="a second recording of the SAME meeting (another phone "
+                        "or laptop): audio, or the pipeline.json of an earlier "
+                        "run of it. It is lined up with the first on the words, "
+                        "and the run also writes transcript_merged.md and "
+                        "disagreements.md. See docs/two-recordings.md.")
+    r.add_argument("--primary", choices=["louder", "first", "second"],
+                   default="louder",
+                   help="with --second: which recording is the default text and "
+                        "gets the speakers and notes (default: the louder one; "
+                        "the first when --transcript or a pipeline.json is used)")
+    r.add_argument("--no-judge", action="store_true",
+                   help="with --second: skip the LLM pass that judges, on "
+                        "meaning, where the two recordings disagree, and rank "
+                        "by word overlap alone (a poor test)")
     r.add_argument("--align-chunk", type=float, default=None,
                    help=f"seconds of audio per alignment chunk (default "
                         f"{int(ALIGN_CHUNK_SECONDS)} transcribing, "
