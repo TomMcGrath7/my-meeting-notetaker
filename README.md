@@ -83,7 +83,7 @@ python3.12 -m venv .venv          # any python >= 3.10
 .venv/bin/pip install -r requirements.txt -r requirements-llm-seam.txt
 ```
 
-That pins llm-seam to a release tag (`v0.9.0`; the context-size option the
+That pins llm-seam to a release tag (`v0.12.0`; the context-size option the
 notetaker needs arrived in `v0.8.0`). With llm-seam checked out beside this repo,
 `.venv/bin/pip install -e ../llm-seam` follows that checkout instead.
 
