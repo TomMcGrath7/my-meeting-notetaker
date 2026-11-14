@@ -161,6 +161,15 @@ and an invented dialogue about a market crash, while the same audio in short
 chunks came back as what was said. A filter then replaces any decoder loop
 that still gets through with `[…]`.
 
+**Never run `speech transcribe` on a whole long file** (checked 2026-11-13 on a 14-minute,
+noisy, multi-person room recording). Whisper looped on one phrase and kept about 1160 of
+roughly 1700 words; Qwen3-ASR 1.7B stopped after 441. Cut into 25-second chunks, Qwen3
+1.7B gave the fullest text (and got file types like `.kml` and "DWG" right where Whisper
+garbled them); Whisper chunked was close behind and read better on some phrases. Far-field
+room audio is still rough on either (names and numbers are misheard). `notetaker.py run
+--model 1.7B` gave the same opening as 0.6B, so that flag's effect on the ASR step is
+unproven.
+
 `--no-vad` goes back to fixed windows over the whole file. Those windows, and
 the ones a provided transcript uses, differ by mode:
 
