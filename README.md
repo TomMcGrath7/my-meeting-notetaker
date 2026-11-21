@@ -479,7 +479,7 @@ dropping a memo on its Dock icon both work. A file opened that way fills the
 current tab if it has no recording yet, and gets a tab of its own otherwise.
 
 **Several memos: tabs and a queue.** Each memo has its own tab, holding its own
-recording, participants, context and controls; **+** (⌘T) opens another and
+recording, participants, context and controls; **+** (⌘T, or File ▸ New Memo Tab) opens another and
 copies the controls (backend, model, denoise, diarizer, ASR size, language),
 but not the recording or roster. **Process** (⌘Return) on an idle app starts at
 once; while something runs or waits, the button reads **Add to queue**. Queued memos run one at a time, top to bottom, so only
