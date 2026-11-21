@@ -500,6 +500,12 @@ pipeline uses and appended to whatever is already in the box; nothing leaves the
 machine. First click prompts for Microphone access. Because the app is ad-hoc
 signed, macOS may re-prompt after a rebuild.
 
+The **context** box has a mic button: click it, say what the call is about, click
+again to stop. The note is transcribed on this Mac with the same speech model the
+pipeline uses and appended to whatever is already in the box; nothing leaves the
+machine. First click prompts for Microphone access. Because the app is ad-hoc
+signed, macOS may re-prompt after a rebuild.
+
 **Shortcut (no Xcode needed)** — make a Shortcut that **Receives audio**, then
 **Run Shell Script** with:
 
