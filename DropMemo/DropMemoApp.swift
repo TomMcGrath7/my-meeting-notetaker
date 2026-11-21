@@ -728,8 +728,7 @@ struct ContentView: View {
                     Image(systemName: "plus").frame(width: 22, height: 22)
                 }
                 .buttonStyle(.borderless)
-                .keyboardShortcut("t", modifiers: [.command])
-                .help("New memo tab (⌘T)")
+                .help("New memo tab (⌘T, or File ▸ New Memo Tab)")
             }
             .padding(.horizontal, 10).padding(.vertical, 6)
         }
@@ -1205,5 +1204,14 @@ struct DropMemoApp: App {
             ContentView()
         }
         .windowResizability(.contentMinSize)
+        // ⌘T as a menu item, not a shortcut on the + button: a button's shortcut
+        // inside the scrolling tab strip didn't fire, and a focused text box
+        // could take ⌘T first. Menu key equivalents are matched before either.
+        .commands {
+            CommandGroup(replacing: .newItem) {
+                Button("New Memo Tab") { JobQueue.shared.newTab() }
+                    .keyboardShortcut("t", modifiers: [.command])
+            }
+        }
     }
 }
