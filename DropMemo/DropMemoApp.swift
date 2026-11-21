@@ -76,17 +76,58 @@ enum DiarizeEngine: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
-// MARK: - Model: owns the log + drives the Process
+// MARK: - Job: one memo tab (its recording, roster and controls) + its run state
+
+enum JobStatus: Equatable {
+    case draft                 // being filled in; not in the queue
+    case queued
+    case running
+    case done(outDir: String)
+    case failed(status: Int32)
+    case stopped
+
+    var label: String {
+        switch self {
+        case .draft:   return "Draft"
+        case .queued:  return "Queued"
+        case .running: return "Running"
+        case .done:    return "Done"
+        case .failed:  return "Failed"
+        case .stopped: return "Stopped"
+        }
+    }
+    var isFinished: Bool {
+        switch self {
+        case .done, .failed, .stopped: return true
+        default: return false
+        }
+    }
+    var symbol: String {
+        switch self {
+        case .draft:   return "square.and.pencil"
+        case .queued:  return "clock"
+        case .running: return "gearshape.2"
+        case .done:    return "checkmark.circle.fill"
+        case .failed:  return "xmark.octagon.fill"
+        case .stopped: return "stop.circle"
+        }
+    }
+    var color: Color {
+        switch self {
+        case .done:    return .green
+        case .failed:  return .red
+        case .running: return .accentColor
+        default:       return .secondary
+        }
+    }
+}
 
 @MainActor
-final class PipelineModel: ObservableObject {
-    static let shared = PipelineModel()
+final class Job: ObservableObject, Identifiable {
+    let id = UUID()
 
     @Published var audioURL: URL?
     @Published var secondURL: URL?                    // optional: the same meeting, recorded on another device
-    @Published var log: String = ""
-    @Published var isRunning = false
-    @Published var lastOutDir: String?
 
     // Controls strip
     // Claude-sub by default: the two text steps are the ones that want a strong
@@ -101,15 +142,32 @@ final class PipelineModel: ObservableObject {
     @Published var transcriptText: String = ""        // optional: paste a transcript to force-align
     @Published var transcriptURL: URL?                // …or attach one from a file (fallback)
 
-    // Meeting roster — written to config.yaml on each run (the pipeline reads it
-    // to name speakers). Comma- or newline-separated names.
+    // Meeting roster — written to config.yaml right before this job runs (the
+    // pipeline reads it to name speakers). Comma- or newline-separated names.
     @Published var participants: String = ""
     @Published var context: String = ""
 
-    private var task: Process?
-    private var stopped = false
+    @Published var status: JobStatus = .draft
+    @Published var log: String = ""
+    @Published var isOpen = true                      // has a tab in the strip
 
-    init() { loadConfig() }
+    /// Drafts and queued jobs can still be edited: config.yaml and the flags
+    /// are only built from these fields when the job starts.
+    var isEditable: Bool { status == .draft || status == .queued }
+
+    var title: String { audioURL?.lastPathComponent ?? "New memo" }
+
+    var outDir: String? {
+        if case .done(let out) = status { return out }
+        return nil
+    }
+
+    /// A new tab takes over the previous tab's controls (backend, model, ASR…),
+    /// but not its recording, transcript or roster: those belong to one meeting.
+    func copyControls(from o: Job) {
+        backend = o.backend; model = o.model; denoise = o.denoise
+        diarize = o.diarize; asrModel = o.asrModel; language = o.language
+    }
 
     /// Default model name to show when the backend toggles.
     func backendChanged() {
@@ -132,11 +190,137 @@ final class PipelineModel: ObservableObject {
         appendLine("• second recording: \(url.lastPathComponent)")
     }
 
-    // MARK: config.yaml <-> UI
+    func append(_ s: String) { log += s }
+    func appendLine(_ s: String) { log += s + "\n" }
+}
+
+// MARK: - Queue: owns every job and runs them one at a time
+
+enum Tab: Hashable {
+    case jobs
+    case job(UUID)
+}
+
+@MainActor
+final class JobQueue: ObservableObject {
+    static let shared = JobQueue()
+
+    @Published var jobs: [Job] = []
+    @Published var selection: Tab = .jobs
+    /// Set by Stop, so the next queued job doesn't start by itself the moment
+    /// the stopped one exits. Resume clears it.
+    @Published var paused = false
+
+    private var task: Process?
+    private var current: Job?
+    private var stopped = false
+
+    init() {
+        let first = Job()
+        loadConfig(into: first)
+        jobs = [first]
+        selection = .job(first.id)
+    }
+
+    var openJobs: [Job] { jobs.filter(\.isOpen) }
+    var isRunning: Bool { current != nil }
+    var queuedCount: Int { jobs.filter { $0.status == .queued }.count }
+
+    func job(_ id: UUID) -> Job? { jobs.first { $0.id == id } }
+
+    var selectedJob: Job? {
+        if case .job(let id) = selection { return job(id) }
+        return nil
+    }
+
+    // MARK: tabs
+
+    @discardableResult
+    func newTab() -> Job {
+        let j = Job()
+        if let from = selectedJob ?? jobs.last { j.copyControls(from: from) }
+        jobs.append(j)
+        selection = .job(j.id)
+        return j
+    }
+
+    func open(_ j: Job) {
+        j.isOpen = true
+        selection = .job(j.id)
+    }
+
+    /// Closing a draft's tab throws the draft away. Any other job only loses its
+    /// tab and stays listed under Jobs.
+    func close(_ j: Job) {
+        if j.status == .draft {
+            jobs.removeAll { $0.id == j.id }
+        } else {
+            j.isOpen = false
+        }
+        if selection == .job(j.id) {
+            selection = openJobs.last.map { .job($0.id) } ?? .jobs
+        }
+    }
+
+    /// Files from Finder "Open With", the Dock icon or the Share sheet: the
+    /// first fills the current tab if it has no recording yet, the rest each get
+    /// a tab of their own.
+    func openFiles(_ urls: [URL]) {
+        for url in urls {
+            if let j = selectedJob, j.isEditable, j.audioURL == nil {
+                j.accept(url)
+            } else {
+                newTab().accept(url)
+            }
+        }
+    }
+
+    // MARK: queue
+
+    func enqueue(_ j: Job) {
+        // A draft joins the queue; a finished job (done, failed, stopped) runs again.
+        guard j.audioURL != nil, j.status == .draft || j.status.isFinished else { return }
+        j.status = .queued
+        j.appendLine("• queued")
+        startNextIfIdle()
+    }
+
+    /// Take a queued job out of the queue again (back to a draft).
+    func unqueue(_ j: Job) {
+        guard j.status == .queued else { return }
+        j.status = .draft
+        j.appendLine("• taken out of the queue")
+    }
+
+    func remove(_ j: Job) {
+        guard j.status != .running else { return }
+        jobs.removeAll { $0.id == j.id }
+        if selection == .job(j.id) { selection = .jobs }
+    }
+
+    func clearFinished() {
+        jobs.removeAll { $0.status.isFinished }
+        if case .job(let id) = selection, job(id) == nil { selection = .jobs }
+    }
+
+    func resume() {
+        paused = false
+        startNextIfIdle()
+    }
+
+    /// The one place a run starts, so two pipelines (two ASR models, two LLMs)
+    /// never sit in RAM at once.
+    private func startNextIfIdle() {
+        guard current == nil, !paused,
+              let next = jobs.first(where: { $0.status == .queued }) else { return }
+        run(next)
+    }
+
+    // MARK: config.yaml <-> a job
 
     /// Minimal reader for the `participants:` list and `context: |` block this
     /// app writes (and the example file). Not a general YAML parser.
-    func loadConfig() {
+    func loadConfig(into j: Job) {
         guard let text = try? String(contentsOfFile: Repo.configPath, encoding: .utf8) else { return }
         var names: [String] = []
         var ctx: [String] = []
@@ -154,20 +338,22 @@ final class PipelineModel: ObservableObject {
                 inCtx = true
             }
         }
-        if !names.isEmpty { participants = names.joined(separator: ", ") }
+        if !names.isEmpty { j.participants = names.joined(separator: ", ") }
         let c = ctx.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
-        if !c.isEmpty { context = c }
+        if !c.isEmpty { j.context = c }
     }
 
-    /// Write the roster fields back to config.yaml so the pipeline picks them up.
-    func writeConfig() {
-        let names = participants
+    /// Write a job's roster to config.yaml so the pipeline picks it up. Called
+    /// right before that job starts, and only one job runs at a time, so each
+    /// run reads its own roster.
+    private func writeConfig(_ j: Job) {
+        let names = j.participants
             .split(whereSeparator: { $0 == "," || $0 == "\n" })
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
         var y = "# Written by DropMemo. Edit here or in the app.\nparticipants:\n"
         for n in names { y += "  - \(n)\n" }
-        let ctx = context.trimmingCharacters(in: .whitespacesAndNewlines)
+        let ctx = j.context.trimmingCharacters(in: .whitespacesAndNewlines)
         if !ctx.isEmpty {
             y += "context: |\n"
             for line in ctx.components(separatedBy: "\n") { y += "  \(line)\n" }
@@ -177,51 +363,54 @@ final class PipelineModel: ObservableObject {
 
     // MARK: run
 
-    func run() {
-        guard let audio = audioURL, !isRunning else { return }
+    private func run(_ j: Job) {
+        guard let audio = j.audioURL else { j.status = .draft; return }
         guard FileManager.default.isExecutableFile(atPath: Repo.processSh) else {
-            appendLine("✗ can't find process.sh at \(Repo.processSh)")
-            appendLine("  Set DROPMEMO_REPO, or rebuild so DMRepoPath points at your checkout.")
+            j.appendLine("✗ can't find process.sh at \(Repo.processSh)")
+            j.appendLine("  Set DROPMEMO_REPO, or rebuild so DMRepoPath points at your checkout.")
+            j.status = .failed(status: -1)
+            startNextIfIdle()
             return
         }
 
-        writeConfig()            // roster fields → config.yaml before the run
-        log = ""
-        isRunning = true
+        writeConfig(j)           // this job's roster → config.yaml before the run
+        j.log = ""
+        j.status = .running
+        current = j
         stopped = false
-        lastOutDir = nil
 
         // Map the controls onto process.sh's interface.
         var args = [Repo.processSh, audio.path]
         var env = ProcessInfo.processInfo.environment
-        env["LLM_BACKEND"] = backend.llmBackend
-        switch backend {
+        env["LLM_BACKEND"] = j.backend.llmBackend
+        switch j.backend {
         case .ollama:
-            env["OLLAMA_MODEL"] = model              // process.sh passes this as --model-llm
+            env["OLLAMA_MODEL"] = j.model            // process.sh passes this as --model-llm
         case .claudeSub, .anthropic:
-            args += ["--model-llm", model]           // model id/alias is a pass-through flag
+            args += ["--model-llm", j.model]         // model id/alias is a pass-through flag
         }
-        if denoise { args.append("--denoise") }
-        args += ["--diarize-engine", diarize.rawValue]
-        args += ["--model", asrModel]                // ASR/align size (0.6B|1.7B)
-        let lang = language.trimmingCharacters(in: .whitespaces)
+        if j.denoise { args.append("--denoise") }
+        args += ["--diarize-engine", j.diarize.rawValue]
+        args += ["--model", j.asrModel]              // ASR/align size (0.6B|1.7B)
+        let lang = j.language.trimmingCharacters(in: .whitespaces)
         if !lang.isEmpty { args += ["--language", lang] }
         // Optional transcript to force-align (e.g. a Voice Memos export). Pasted
-        // text wins over an attached file; write it to a temp file for --transcript.
-        if !transcriptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        // text wins over an attached file; write it to a temp file for
+        // --transcript, one per job so a queued job's text isn't overwritten.
+        if !j.transcriptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             let dir = FileManager.default.temporaryDirectory.appendingPathComponent("DropMemo", isDirectory: true)
             try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            let f = dir.appendingPathComponent("pasted-transcript.txt")
-            if (try? transcriptText.write(to: f, atomically: true, encoding: .utf8)) != nil {
+            let f = dir.appendingPathComponent("pasted-transcript-\(j.id.uuidString).txt")
+            if (try? j.transcriptText.write(to: f, atomically: true, encoding: .utf8)) != nil {
                 args += ["--transcript", f.path]
             }
-        } else if let t = transcriptURL {
+        } else if let t = j.transcriptURL {
             args += ["--transcript", t.path]
         }
 
         // A second recording of the same meeting: notetaker lines the two up on
         // their words and also writes transcript_merged.md + disagreements.md.
-        if let second = secondURL { args += ["--second", second.path] }
+        if let second = j.secondURL { args += ["--second", second.path] }
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/bash")
@@ -231,32 +420,37 @@ final class PipelineModel: ObservableObject {
         let pipe = Pipe()
         proc.standardOutput = pipe
         proc.standardError = pipe
-        pipe.fileHandleForReading.readabilityHandler = { handle in
+        pipe.fileHandleForReading.readabilityHandler = { [weak j] handle in
             let data = handle.availableData
             guard !data.isEmpty, let chunk = String(data: data, encoding: .utf8) else { return }
-            Task { @MainActor in PipelineModel.shared.append(chunk) }
+            Task { @MainActor in j?.append(chunk) }
         }
         proc.terminationHandler = { p in
-            Task { @MainActor in PipelineModel.shared.finished(status: p.terminationStatus) }
+            Task { @MainActor in JobQueue.shared.finished(status: p.terminationStatus) }
         }
 
         self.task = proc
-        appendLine("▶ processing \(audio.lastPathComponent)…\n")
+        j.appendLine("▶ processing \(audio.lastPathComponent)…\n")
         do {
             try proc.run()
         } catch {
-            isRunning = false
-            appendLine("✗ failed to launch: \(error.localizedDescription)")
+            j.appendLine("✗ failed to launch: \(error.localizedDescription)")
+            pipe.fileHandleForReading.readabilityHandler = nil
+            task = nil
+            current = nil
+            j.status = .failed(status: -1)
+            startNextIfIdle()
         }
     }
 
-    /// Stop a run: SIGTERM the whole process tree (bash → python → speech/ffmpeg/
-    /// claude), since terminating just the bash parent would leave the heavy
-    /// `speech` child running.
+    /// Stop the running job: SIGTERM the whole process tree (bash → python →
+    /// speech/ffmpeg/claude), since terminating just the bash parent would leave
+    /// the heavy `speech` child running. The queue pauses; Resume carries on.
     func stop() {
-        guard isRunning, let p = task else { return }
+        guard let p = task, let j = current else { return }
         stopped = true
-        appendLine("\n⏹ stopping…")
+        paused = true
+        j.appendLine("\n⏹ stopping…")
         Self.killTree(pid: p.processIdentifier)
         p.terminate()
     }
@@ -278,29 +472,33 @@ final class PipelineModel: ObservableObject {
     }
 
     private func finished(status: Int32) {
-        task?.standardOutput.flatMap { ($0 as? Pipe) }?.fileHandleForReading.readabilityHandler = nil
+        (task?.standardOutput as? Pipe)?.fileHandleForReading.readabilityHandler = nil
         task = nil
-        isRunning = false
+        guard let j = current else { return }
+        current = nil
         if stopped {
-            appendLine("\n⏹ stopped.")
-        } else if status == 0, let out = parseOutDir() {
-            lastOutDir = out
-            appendLine("\n✓ done — opening \(out)")
-            reveal(out)
+            j.status = .stopped
+            j.appendLine("\n⏹ stopped.")
+        } else if status == 0, let out = Self.parseOutDir(j.log) {
+            j.status = .done(outDir: out)
+            j.appendLine("\n✓ done — opening \(out)")
+            Self.reveal(out)
         } else {
-            appendLine("\n✗ pipeline exited with status \(status)")
+            j.status = .failed(status: status)
+            j.appendLine("\n✗ pipeline exited with status \(status)")
         }
+        startNextIfIdle()
     }
 
     /// process.sh prints `OUT_DIR=/abs/path` as its last line.
-    private func parseOutDir() -> String? {
+    private static func parseOutDir(_ log: String) -> String? {
         for line in log.split(separator: "\n").reversed() where line.hasPrefix("OUT_DIR=") {
             return String(line.dropFirst("OUT_DIR=".count))
         }
         return nil
     }
 
-    private func reveal(_ outDir: String) {
+    static func reveal(_ outDir: String) {
         let notes = outDir + "/notes.md"
         if FileManager.default.fileExists(atPath: notes) {
             NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: notes)])
@@ -309,9 +507,6 @@ final class PipelineModel: ObservableObject {
             NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: outDir)])
         }
     }
-
-    func append(_ s: String) { log += s }
-    private func appendLine(_ s: String) { log += s + "\n" }
 }
 
 // MARK: - Voice note: say the context instead of typing it
@@ -468,10 +663,181 @@ struct VoiceNoteButton: View {
     }
 }
 
-// MARK: - View
+// MARK: - View: a tab strip (Jobs, one tab per memo, +) over the selected page
 
 struct ContentView: View {
-    @ObservedObject var m = PipelineModel.shared
+    @ObservedObject var q = JobQueue.shared
+
+    var body: some View {
+        VStack(spacing: 0) {
+            tabStrip
+            Divider()
+            Group {
+                switch q.selection {
+                case .jobs:
+                    JobsView()
+                case .job(let id):
+                    if let j = q.job(id) {
+                        MemoView(job: j).id(j.id)     // fresh voice-note state per tab
+                    } else {
+                        JobsView()
+                    }
+                }
+            }
+            .padding(16)
+        }
+        .frame(minWidth: 620, minHeight: 800)
+    }
+
+    private var tabStrip: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 4) {
+                TabButton(selected: q.selection == .jobs, action: { q.selection = .jobs }) {
+                    Image(systemName: "list.bullet")
+                    Text(q.queuedCount > 0 ? "Jobs (\(q.queuedCount) queued)" : "Jobs")
+                }
+                ForEach(q.openJobs) { j in
+                    JobTab(job: j, selected: q.selection == .job(j.id))
+                }
+                Button { q.newTab() } label: {
+                    Image(systemName: "plus").frame(width: 22, height: 22)
+                }
+                .buttonStyle(.borderless)
+                .keyboardShortcut("t", modifiers: [.command])
+                .help("New memo tab (⌘T)")
+            }
+            .padding(.horizontal, 10).padding(.vertical, 6)
+        }
+    }
+}
+
+struct TabButton<Label: View>: View {
+    let selected: Bool
+    let action: () -> Void
+    @ViewBuilder let label: () -> Label
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 5) { label() }
+                .font(.callout)
+                .padding(.horizontal, 10).padding(.vertical, 5)
+                .background(RoundedRectangle(cornerRadius: 6)
+                    .fill(selected ? Color.accentColor.opacity(0.18) : Color.clear))
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+/// One memo's tab: its status icon, the file name, and a close button.
+struct JobTab: View {
+    @ObservedObject var job: Job
+    let selected: Bool
+
+    var body: some View {
+        TabButton(selected: selected, action: { JobQueue.shared.selection = .job(job.id) }) {
+            Image(systemName: job.status.symbol).foregroundColor(job.status.color)
+            Text(job.title).lineLimit(1).truncationMode(.middle).frame(maxWidth: 160)
+            Button { JobQueue.shared.close(job) } label: {
+                Image(systemName: "xmark").font(.system(size: 9, weight: .bold))
+            }
+            .buttonStyle(.borderless)
+            .help(job.status == .draft ? "Close and discard this draft" : "Close the tab (the job stays under Jobs)")
+        }
+    }
+}
+
+// MARK: Jobs page
+
+struct JobsView: View {
+    @ObservedObject var q = JobQueue.shared
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("Jobs run one at a time, top to bottom, so only one pipeline is ever in memory.")
+                    .font(.caption).foregroundColor(.secondary)
+                Spacer()
+                if q.isRunning {
+                    Button("Stop current") { q.stop() }.tint(.red)
+                }
+                if q.paused {
+                    Button("Resume queue") { q.resume() }
+                }
+                Button("Clear finished") { q.clearFinished() }
+                    .disabled(!q.jobs.contains { $0.status.isFinished })
+            }
+            if q.paused {
+                Text("Paused after Stop: queued jobs wait until you resume.")
+                    .font(.caption).foregroundColor(.orange)
+            }
+            if q.jobs.isEmpty {
+                Spacer()
+                Text("No jobs. Press + to start a memo.").foregroundColor(.secondary)
+                    .frame(maxWidth: .infinity)
+                Spacer()
+            } else {
+                List {
+                    ForEach(q.jobs) { j in JobRow(job: j) }
+                }
+                .listStyle(.inset(alternatesRowBackgrounds: true))
+            }
+        }
+    }
+}
+
+struct JobRow: View {
+    @ObservedObject var job: Job
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: job.status.symbol).foregroundColor(job.status.color).frame(width: 18)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(job.title + (job.secondURL != nil ? "  + second recording" : ""))
+                    .lineLimit(1).truncationMode(.middle)
+                Text(detail).font(.caption).foregroundColor(.secondary).lineLimit(1)
+            }
+            Spacer()
+            Text(job.status.label).font(.caption).foregroundColor(job.status.color)
+            actions
+        }
+        .padding(.vertical, 3)
+        .contentShape(Rectangle())
+        .onTapGesture { JobQueue.shared.open(job) }
+        .help("Click to open this memo's tab")
+    }
+
+    private var detail: String {
+        let who = job.participants.trimmingCharacters(in: .whitespacesAndNewlines)
+        return [job.backend.rawValue + " · " + job.model, who.isEmpty ? nil : who]
+            .compactMap { $0 }.joined(separator: "  ·  ")
+    }
+
+    @ViewBuilder private var actions: some View {
+        let q = JobQueue.shared
+        switch job.status {
+        case .draft:
+            Button("Queue") { q.enqueue(job) }.disabled(job.audioURL == nil)
+            Button { q.remove(job) } label: { Image(systemName: "trash") }.buttonStyle(.borderless)
+        case .queued:
+            Button("Unqueue") { q.unqueue(job) }
+        case .running:
+            Button("Stop") { q.stop() }.tint(.red)
+        case .done(let out):
+            Button("Notes") { JobQueue.reveal(out) }
+            Button { q.remove(job) } label: { Image(systemName: "trash") }.buttonStyle(.borderless)
+        case .failed, .stopped:
+            Button("Run again") { q.enqueue(job) }
+            Button { q.remove(job) } label: { Image(systemName: "trash") }.buttonStyle(.borderless)
+        }
+    }
+}
+
+// MARK: Memo page: the form for one recording
+
+struct MemoView: View {
+    @ObservedObject var job: Job
+    @ObservedObject var q = JobQueue.shared
     @StateObject private var voiceNote = VoiceNote()
     @State private var dropHighlight = false
     @State private var secondHighlight = false
@@ -486,8 +852,6 @@ struct ContentView: View {
             logView
             statusBar
         }
-        .padding(16)
-        .frame(minWidth: 580, minHeight: 780)
     }
 
     private var dropZone: some View {
@@ -503,7 +867,7 @@ struct ContentView: View {
                 Image(systemName: "waveform")
                     .font(.system(size: 30))
                     .foregroundColor(.secondary)
-                Text(m.audioURL?.lastPathComponent ?? "Drag a Voice Memo here")
+                Text(job.audioURL?.lastPathComponent ?? "Drag a Voice Memo here")
                     .font(.headline)
                 Text("or").foregroundColor(.secondary).font(.caption)
                 Button("Choose file…") { pickFile() }
@@ -516,20 +880,21 @@ struct ContentView: View {
         .onDrop(of: [.fileURL, .audio, .item], isTargeted: $dropHighlight) { providers in
             handleDrop(providers)
         }
+        .disabled(!job.isEditable)
     }
 
     /// The second drop slot: the same meeting recorded on another device.
     private var secondRow: some View {
         HStack(spacing: 8) {
             Image(systemName: "waveform.badge.plus").foregroundColor(.secondary)
-            Text(m.secondURL.map { "Second recording: \($0.lastPathComponent)" }
+            Text(job.secondURL.map { "Second recording: \($0.lastPathComponent)" }
                  ?? "Second recording of the same meeting (optional): drop it here")
                 .font(.caption).foregroundColor(.secondary)
                 .lineLimit(1).truncationMode(.middle)
             Spacer()
             Button("Choose…") { pickFile(second: true) }
-            if m.secondURL != nil {
-                Button("Clear") { m.secondURL = nil }
+            if job.secondURL != nil {
+                Button("Clear") { job.secondURL = nil }
             }
         }
         .padding(.horizontal, 10).padding(.vertical, 6)
@@ -542,21 +907,21 @@ struct ContentView: View {
             handleDrop(providers, second: true)
         }
         .help("The same meeting recorded on another phone or laptop. The louder recording becomes the transcript; the other fills its gaps, and disagreements.md lists where the two differ.")
-        .disabled(m.isRunning)
+        .disabled(!job.isEditable)
     }
 
     private var roster: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text("Who's in the meeting  (saved to config.yaml)")
+            Text("Who's in the meeting  (written to config.yaml when this memo starts)")
                 .font(.caption).foregroundColor(.secondary)
-            TextField("Participants, comma-separated (e.g. Tom, Olly)", text: $m.participants)
+            TextField("Participants, comma-separated (e.g. Tom, Olly)", text: $job.participants)
                 .textFieldStyle(.roundedBorder)
-            TextEditor(text: $m.context)
+            TextEditor(text: $job.context)
                 .font(.system(.caption, design: .default))
                 .frame(height: 56)
                 .overlay(RoundedRectangle(cornerRadius: 5).stroke(.secondary.opacity(0.3)))
                 .overlay(alignment: .topLeading) {
-                    if m.context.isEmpty {
+                    if job.context.isEmpty {
                         Text("Optional context: roles, who dials in, recurring topics… or use the mic")
                             .font(.caption).foregroundColor(.secondary)
                             .padding(.horizontal, 5).padding(.vertical, 4).allowsHitTesting(false)
@@ -564,9 +929,9 @@ struct ContentView: View {
                 }
                 .overlay(alignment: .bottomTrailing) {
                     VoiceNoteButton(note: voiceNote) {
-                        voiceNote.start(model: m.asrModel, language: m.language) { text in
-                            let ctx = m.context.trimmingCharacters(in: .whitespacesAndNewlines)
-                            m.context = ctx.isEmpty ? text : ctx + " " + text
+                        voiceNote.start(model: job.asrModel, language: job.language) { [job] text in
+                            let ctx = job.context.trimmingCharacters(in: .whitespacesAndNewlines)
+                            job.context = ctx.isEmpty ? text : ctx + " " + text
                         }
                     }
                     .padding(2)
@@ -580,29 +945,29 @@ struct ContentView: View {
                 Text("Transcribing on this Mac…").font(.caption).foregroundColor(.secondary)
             }
         }
-        .disabled(m.isRunning)
+        .disabled(!job.isEditable)
     }
 
     private var controls: some View {
         HStack(spacing: 14) {
-            Picker("Backend", selection: $m.backend) {
+            Picker("Backend", selection: $job.backend) {
                 ForEach(Backend.allCases) { Text($0.rawValue).tag($0) }
             }
             .fixedSize()
-            .onChange(of: m.backend) { _ in m.backendChanged() }
+            .onChange(of: job.backend) { _ in job.backendChanged() }
 
-            TextField("model", text: $m.model)
+            TextField("model", text: $job.model)
                 .textFieldStyle(.roundedBorder)
                 .frame(minWidth: 140)
 
-            Toggle("Denoise", isOn: $m.denoise)
+            Toggle("Denoise", isOn: $job.denoise)
 
-            Picker("Diarize", selection: $m.diarize) {
+            Picker("Diarize", selection: $job.diarize) {
                 ForEach(DiarizeEngine.allCases) { Text($0.rawValue).tag($0) }
             }
             .fixedSize()
 
-            Picker("ASR", selection: $m.asrModel) {
+            Picker("ASR", selection: $job.asrModel) {
                 Text("0.6B").tag("0.6B")        // faster
                 Text("1.7B").tag("1.7B")        // accurate
             }
@@ -611,11 +976,11 @@ struct ContentView: View {
 
             HStack(spacing: 4) {
                 Text("Lang").foregroundColor(.secondary)
-                TextField("auto", text: $m.language).frame(width: 42).textFieldStyle(.roundedBorder)
+                TextField("auto", text: $job.language).frame(width: 42).textFieldStyle(.roundedBorder)
             }
             .help("Language hint for speech ASR, e.g. nl or en. Blank = auto-detect.")
         }
-        .disabled(m.isRunning)
+        .disabled(!job.isEditable)
     }
 
     private var transcriptRow: some View {
@@ -625,32 +990,32 @@ struct ContentView: View {
                     .font(.caption).foregroundColor(.secondary)
                 Spacer()
                 Button("Attach file…") { pickTranscript() }
-                if !m.transcriptText.isEmpty || m.transcriptURL != nil {
-                    Button("Clear") { m.transcriptText = ""; m.transcriptURL = nil }
+                if !job.transcriptText.isEmpty || job.transcriptURL != nil {
+                    Button("Clear") { job.transcriptText = ""; job.transcriptURL = nil }
                 }
             }
-            TextEditor(text: $m.transcriptText)
+            TextEditor(text: $job.transcriptText)
                 .font(.system(.caption, design: .default))
                 .frame(height: 48)
                 .overlay(RoundedRectangle(cornerRadius: 5).stroke(.secondary.opacity(0.3)))
                 .overlay(alignment: .topLeading) {
-                    if m.transcriptText.isEmpty {
-                        Text(m.transcriptURL.map { "Using file: \($0.lastPathComponent)" }
+                    if job.transcriptText.isEmpty {
+                        Text(job.transcriptURL.map { "Using file: \($0.lastPathComponent)" }
                              ?? "Leave empty to transcribe the memo. Only paste a transcript in the memo's own language.")
                             .font(.caption).foregroundColor(.secondary)
                             .padding(.horizontal, 5).padding(.vertical, 4).allowsHitTesting(false)
                     }
                 }
         }
-        .disabled(m.isRunning)
+        .disabled(!job.isEditable)
     }
 
     private var logView: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                Text(m.log.isEmpty ? "Pipeline output will stream here." : m.log)
+                Text(job.log.isEmpty ? "Pipeline output will stream here." : job.log)
                     .font(.system(.caption, design: .monospaced))
-                    .foregroundColor(m.log.isEmpty ? .secondary : .primary)
+                    .foregroundColor(job.log.isEmpty ? .secondary : .primary)
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(8)
@@ -658,7 +1023,7 @@ struct ContentView: View {
             }
             .background(Color(nsColor: .textBackgroundColor))
             .clipShape(RoundedRectangle(cornerRadius: 8))
-            .onChange(of: m.log) { _ in
+            .onChange(of: job.log) { _ in
                 withAnimation { proxy.scrollTo("logTail", anchor: .bottom) }
             }
         }
@@ -666,24 +1031,44 @@ struct ContentView: View {
 
     private var statusBar: some View {
         HStack {
-            if m.isRunning {
+            switch job.status {
+            case .running:
                 ProgressView().controlSize(.small)
                 Text("Processing…").foregroundColor(.secondary)
-            } else if let out = m.lastOutDir {
+            case .queued:
+                Text(q.isRunning || q.paused
+                     ? "Queued: starts when the jobs ahead of it finish. You can still edit it."
+                     : "Queued").foregroundColor(.secondary)
+            case .done(let out):
                 Text("Done → \(out)").foregroundColor(.secondary)
                     .lineLimit(1).truncationMode(.head)
-            } else {
-                Text("Ready").foregroundColor(.secondary)
+            case .failed(let status):
+                Text("Failed (exit \(status))").foregroundColor(.red)
+            case .stopped:
+                Text("Stopped").foregroundColor(.secondary)
+            case .draft:
+                Text(q.isRunning ? "Another memo is processing; this one will wait its turn." : "Ready")
+                    .foregroundColor(.secondary)
             }
             Spacer()
-            if m.isRunning {
-                Button("Stop") { m.stop() }
+            switch job.status {
+            case .draft:
+                // Starts straight away when nothing is running; otherwise waits.
+                Button(q.isRunning || q.queuedCount > 0 || q.paused ? "Add to queue" : "Process") { q.enqueue(job) }
+                    .keyboardShortcut(.return, modifiers: [])
+                    .disabled(job.audioURL == nil)
+            case .queued:
+                Button("Unqueue") { q.unqueue(job) }
+            case .running:
+                Button("Stop") { q.stop() }
                     .keyboardShortcut(".", modifiers: [.command])
                     .tint(.red)
+            case .done(let out):
+                Button("Show notes") { JobQueue.reveal(out) }
+                Button("Run again") { q.enqueue(job) }
+            case .failed, .stopped:
+                Button("Run again") { q.enqueue(job) }
             }
-            Button(m.isRunning ? "Running…" : "Process") { m.run() }
-                .keyboardShortcut(.return, modifiers: [])
-                .disabled(m.audioURL == nil || m.isRunning)
         }
     }
 
@@ -691,8 +1076,8 @@ struct ContentView: View {
 
     private func handleDrop(_ providers: [NSItemProvider], second: Bool = false) -> Bool {
         guard let p = providers.first else { return false }
-        let accept: @MainActor (URL) -> Void = { url in
-            if second { PipelineModel.shared.acceptSecond(url) } else { PipelineModel.shared.accept(url) }
+        let accept: @MainActor (URL) -> Void = { [job] url in
+            if second { job.acceptSecond(url) } else { job.accept(url) }
         }
         // Prefer a real file representation: this materializes file *promises*
         // (how Voice Memos vends a recording) into a temp file, not just plain
@@ -702,7 +1087,7 @@ struct ContentView: View {
                   ?? ids.first { $0 == UTType.fileURL.identifier }
         if let id = fileId {
             p.loadFileRepresentation(forTypeIdentifier: id) { url, _ in
-                guard let url, let stable = Self.intoInbox(url, second: second) else { return }
+                guard let url, let stable = Self.intoInbox(url) else { return }
                 Task { @MainActor in accept(stable) }
             }
             return true
@@ -718,15 +1103,16 @@ struct ContentView: View {
     }
 
     /// The URL from loadFileRepresentation is temporary and deleted once the
-    /// handler returns, so copy it somewhere stable before using it. The second
-    /// recording gets its own folder: two phones both call a memo "New Recording",
-    /// and one copy must not overwrite the other.
-    private static func intoInbox(_ src: URL, second: Bool = false) -> URL? {
-        var dir = FileManager.default.temporaryDirectory.appendingPathComponent("DropMemo", isDirectory: true)
-        if second { dir = dir.appendingPathComponent("second", isDirectory: true) }
+    /// handler returns, so copy it somewhere stable before using it. Every drop
+    /// gets its own folder: Voice Memos calls most recordings "New Recording",
+    /// and a memo waiting in the queue must not be overwritten by the next drop
+    /// (or by the second recording of the same meeting).
+    nonisolated private static func intoInbox(_ src: URL) -> URL? {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("DropMemo", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let dest = dir.appendingPathComponent(src.lastPathComponent)
-        try? FileManager.default.removeItem(at: dest)
         do { try FileManager.default.copyItem(at: src, to: dest); return dest }
         catch { return nil }
     }
@@ -737,7 +1123,7 @@ struct ContentView: View {
         panel.canChooseDirectories = false
         panel.allowedContentTypes = [.audio, .mpeg4Audio, .wav, .mp3]
         if panel.runModal() == .OK, let url = panel.url {
-            if second { m.acceptSecond(url) } else { m.accept(url) }
+            if second { job.acceptSecond(url) } else { job.accept(url) }
         }
     }
 
@@ -746,20 +1132,42 @@ struct ContentView: View {
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
         panel.allowedContentTypes = [.plainText, .text]
-        if panel.runModal() == .OK, let url = panel.url { m.transcriptURL = url }
+        if panel.runModal() == .OK, let url = panel.url { job.transcriptURL = url }
     }
 }
 
 // MARK: - App + Open-With handling
 
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     // Files opened via Finder "Open With", the Dock icon, or the Share sheet.
     func application(_ application: NSApplication, open urls: [URL]) {
-        guard let url = urls.first(where: { $0.isFileURL }) else { return }
-        Task { @MainActor in PipelineModel.shared.accept(url) }
+        let files = urls.filter(\.isFileURL)
+        guard !files.isEmpty else { return }
+        JobQueue.shared.openFiles(files)
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ s: NSApplication) -> Bool { true }
+
+    /// The queue lives in memory only, so quitting with work left would drop it
+    /// without a word (and orphan a running pipeline). Ask first, and stop the
+    /// running job's process tree if the answer is yes.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        do {
+            let q = JobQueue.shared
+            guard q.isRunning || q.queuedCount > 0 else { return .terminateNow }
+            let alert = NSAlert()
+            alert.messageText = "Quit DropMemo with work left?"
+            alert.informativeText = (q.isRunning ? "A memo is still processing and will be stopped. " : "")
+                + (q.queuedCount > 0 ? "\(q.queuedCount) queued memo(s) will be forgotten." : "")
+            alert.addButton(withTitle: "Keep running")
+            alert.addButton(withTitle: "Quit")
+            guard alert.runModal() == .alertSecondButtonReturn else { return .terminateCancel }
+            q.stop()
+            return .terminateNow
+        }
+    }
 }
+
 
 @main
 struct DropMemoApp: App {
