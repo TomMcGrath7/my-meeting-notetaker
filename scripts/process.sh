@@ -32,10 +32,11 @@
 
 set -euo pipefail
 
-# Ensure Homebrew binaries (`speech`, `ffmpeg`, etc.) and the `claude` CLI
-# (installed under ~/.local/bin) are on PATH. GUI apps like DropMemo launch
-# this script with a minimal PATH that has neither.
-export PATH="/opt/homebrew/bin:$HOME/.local/bin:$PATH"
+# An app launched from Finder/Dock (DropMemo) or a Shortcut inherits the bare GUI
+# PATH (/usr/bin:/bin:/usr/sbin:/sbin), not the shell's, so Homebrew's `speech`
+# and `ffmpeg` and ~/.local/bin's `claude` are invisible and notetaker dies on
+# "required binary 'speech' not found on PATH". Put the usual install dirs first.
+export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH"
 
 # --- locate the repo (this script lives in <repo>/scripts) -------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

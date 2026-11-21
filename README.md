@@ -20,10 +20,18 @@ audio.m4a
   ├─ ffmpeg            → 16 kHz mono wav
   ├─ speech denoise    → clean.wav            (optional, good for calls)
   ├─ speech diarize    → who spoke when        (turns)
-  ├─ speech align      → word-level timestamps (words)
+  ├─ speech vad        → where the speech is   (silence is never transcribed)
+  ├─ speech align      → word-level timestamps (words), ~60s of speech a call
   ├─ bucket            → speaker segments       [local, no model]
   ├─ LLM relabel       → SPEAKER_00 → "Tom", flag low-confidence  [text only]
+  ├─ LLM translate     → English transcript, if the memo isn't English [text only]
   └─ LLM notes         → summary / decisions / actions            [text only]
+
+--second other.m4a     (the same meeting, recorded on another device)
+  ├─ speech vad/align  → its words; no diarization
+  ├─ line up on words  → offset + clock drift   [local, no model]
+  ├─ shared windows    → the two paired, cut at pauses [local, no model]
+  └─ LLM judge         → where the two disagree, on meaning       [text only]
 ```
 
 The split is deliberate: the **acoustic** layer (`speech`) decides *when* the
@@ -75,7 +83,7 @@ python3.12 -m venv .venv          # any python >= 3.10
 .venv/bin/pip install -r requirements.txt -r requirements-llm-seam.txt
 ```
 
-That pins llm-seam to a release tag (`v0.9.0`; the context-size option the
+That pins llm-seam to a release tag (`v0.12.0`; the context-size option the
 notetaker needs arrived in `v0.8.0`). With llm-seam checked out beside this repo,
 `.venv/bin/pip install -e ../llm-seam` follows that checkout instead.
 
@@ -123,7 +131,7 @@ cp config.example.yaml config.yaml && $EDITOR config.yaml
 # 2. full run
 python3 notetaker.py run meeting.m4a --config config.yaml --out-dir ./out
 
-# noisy call, end-to-end Neural-Engine diarizer (default), Dutch hint:
+# noisy call, default (pyannote) diarizer, Dutch hint:
 python3 notetaker.py run call.m4a --denoise --language nl
 
 # iterate on prompts cheaply — skip all audio stages, reuse intermediates:
@@ -142,10 +150,30 @@ notetaker works around this automatically: it slices the audio into
 `--align-chunk` windows, aligns each, and stitches the timestamps back together.
 You don't have to do anything; just know an hour-long file means several passes.
 
-The safe window differs by mode, so the default is adaptive:
+**Transcribing (the default) only sends the speech.** `speech vad` finds where
+people are talking (on a loudness-normalised copy, so a quiet phone call is
+still heard), and the speech is spliced into chunks of about 60 seconds
+(`--vad-chunk`) with short pauses between, then every word is mapped back to
+its real time in the recording. Silence never reaches the ASR, because long
+silence is what breaks it: on an 80-minute, one-sided Spanish call, 5-minute
+chunks that were mostly silence came back as hundreds of "Sisa. SISA. Sasi…"
+and an invented dialogue about a market crash, while the same audio in short
+chunks came back as what was said. A filter then replaces any decoder loop
+that still gets through with `[…]`.
 
-- **transcribing** (no transcript): **300s** — the ASR times its own words and
-  stays coherent across a 5-minute chunk.
+**Never run `speech transcribe` on a whole long file** (checked 2026-11-13 on a 14-minute,
+noisy, multi-person room recording). Whisper looped on one phrase and kept about 1160 of
+roughly 1700 words; Qwen3-ASR 1.7B stopped after 441. Cut into 25-second chunks, Qwen3
+1.7B gave the fullest text (and got file types like `.kml` and "DWG" right where Whisper
+garbled them); Whisper chunked was close behind and read better on some phrases. Far-field
+room audio is still rough on either (names and numbers are misheard). `notetaker.py run
+--model 1.7B` gave the same opening as 0.6B, so that flag's effect on the ASR step is
+unproven.
+
+`--no-vad` goes back to fixed windows over the whole file. Those windows, and
+the ones a provided transcript uses, differ by mode:
+
+- **transcribing** with `--no-vad`: **300s**.
 - **force-aligning** (`--transcript`): **120s** — the forced aligner overloads on
   longer chunks (feeding it ~700 words / 300s makes it dump the whole chunk into
   the first ~140s), so it needs a tighter window.
@@ -154,10 +182,69 @@ Pass `--align-chunk N` to override. If a chunk still collapses, notetaker prints
 a `⚠️ … collapsed` warning to stderr; add `--strict` to make that a hard failure
 (non-zero exit) instead of continuing with unreliable timestamps.
 
+A provided transcript is untimed, so it is first split across chunks by word
+count. Where a chunk got more text than its audio holds, the aligner crushes the
+excess into a tail of zero-length words; a second pass moves that tail into the
+next chunk's text and re-aligns just those two chunks, at most twice
+(`--realign-passes N`, `0` turns it off; chunks already covering 90% of their
+window are left alone). `--align-report` prints, per chunk, the word count, the
+share of words under 0.05s and the window coverage, before and after that pass.
+For a run you already have, `align-report` reads its `pipeline.json` (give the
+chunk size it was aligned with):
+
+```bash
+python3 notetaker.py align-report out-20260702-001651/pipeline.json --align-chunk 300
+```
+
 > Debugging bad speaker cuts or timestamps? Read
 > [`docs/transcript-cut-quality.md`](docs/transcript-cut-quality.md) first — it
 > records the root cause and, importantly, the plausible-but-wrong fixes we
 > already ruled out, so they don't get retried.
+
+### Two recordings of the same meeting
+
+Recorded the meeting on two devices (two phones, a phone and a laptop)? Give
+the second one with `--second`:
+
+```bash
+python3 notetaker.py run phone-a.m4a --second phone-b.m4a --config config.yaml
+
+# both already processed on their own: no audio work at all
+python3 notetaker.py run --from-json out-a/pipeline.json --second out-b/pipeline.json
+```
+
+- **The louder recording is the default** (`--primary louder`, measured with
+  ffmpeg): it gets the diarization, the speaker names, `transcript_named.md`
+  and the notes, exactly as a run without `--second` would. `--primary first`
+  or `second` overrides. With `--transcript`, or when either side is a
+  `pipeline.json`, the first is the default.
+- **The other recording is only transcribed**, then lined up with the first
+  **on the words, not the audio**: runs of 5 matching words (case, accents and
+  punctuation ignored) give the offset between the two clocks, and across 10
+  minutes or more the clock drift. The recordings need not start together. If
+  too few runs agree, the two are not the same conversation: the run says so,
+  merges nothing, and still finishes with the first recording's outputs.
+- **One shared timeline** is cut at pauses (over 1.2s once a window is 8s long,
+  and at 35s regardless) and the two are paired window by window.
+- **An LLM judges each window on meaning** (same / differ / unclear), 45
+  windows a call, because word overlap is a poor test: it is low even where
+  both recordings say the same thing. `--no-judge` skips the call and ranks by
+  word overlap alone.
+
+It writes three more files: `transcript_merged.md` (the default recording's
+text, the other filling the stretches it has nothing for, and a small
+"B heard:" line only where the judge said the two differ), `disagreements.md`
+(the differing windows ranked worst first, each phrase by phrase, with the
+time in both recordings) and `merge.json`. A stretch only the other recording
+heard while the default one was running is marked unconfirmed: a quiet
+recording invents fluent text where it cannot hear.
+
+Not built: the notes and `transcript_en.md` still come from the default
+recording alone, the audio is not volume-normalised before ASR, and there is no
+second-opinion transcription of the disputed passages.
+[`docs/two-recordings.md`](docs/two-recordings.md) is the method this follows,
+worked by hand, and has the traps (`--context` leaking into the transcript, ASR
+on un-normalised quiet audio).
 
 If you already have a transcript (e.g. exported from Voice Memos), hand it over
 and notetaker **force-aligns** it instead of transcribing — better text, and it
@@ -172,8 +259,12 @@ python3 notetaker.py run meeting.m4a --transcript voice-memo.txt
 | file | what |
 |---|---|
 | `transcript_named.md` | speaker-attributed transcript; `⚠️ uncertain` marks flagged turns |
+| `transcript_en.md` | the same transcript in English, when the memo is in another language (`--no-translate` to skip; nothing is written for an English memo or `--language en`) |
 | `notes.md` | summary, key decisions, action items, open questions |
 | `pipeline.json` | every intermediate — re-run the LLM steps without re-processing audio |
+| `transcript_merged.md` | with `--second`: both recordings as one transcript, times on the default recording's clock |
+| `disagreements.md` | with `--second`: where the two recordings disagree, ranked, phrase by phrase |
+| `merge.json`, `second.json` | with `--second`: the offset, drift and every window; and the second recording's words (reuse as `--second out/second.json`) |
 
 ## Tests
 
@@ -195,8 +286,8 @@ Stdlib `unittest` only (no extra deps), no audio/model/network — runs in
 milliseconds. Covers the pure functions that actually break things: the
 `diarize`/`align` output parsers (pinned against captured real `speech` output
 in `tests/fixtures/`, so a format drift fails loudly instead of silently
-corrupting output), word→speaker attribution (`merge`), and the alignment
-chunking + collapse guard. If you upgrade speech-swift and `notetaker.py check`
+corrupting output), word→speaker attribution (`merge`), the alignment
+chunking + collapse guard, and the two-recordings merge (`--second`). If you upgrade speech-swift and `notetaker.py check`
 shows a new output format, re-capture the fixtures.
 
 ## Going fully offline
@@ -366,8 +457,14 @@ Append `--llm-backend openai` to force the older call.
 picker), set **who's in the meeting** (the participants + context fields write
 straight to `config.yaml`, and are pre-filled from it on launch), pick the
 backend / LLM model / denoise / diarize-engine / **ASR size** / **language**,
-optionally **attach a transcript** (a Voice Memos export → force-aligned for
-much better text, especially non-English), watch the pipeline stream live, and
+optionally **attach a transcript** (a Voice Memos export, force-aligned to
+the audio; only one in the memo's own language, since Voice Memos may give an
+English transcript of a Dutch or Spanish memo, and aligning that to the audio
+puts English words on the wrong speech. Leave it empty and the memo is
+transcribed, with `transcript_en.md` written for you), optionally drop a
+**second recording of the same meeting** on the slot under the drop zone (see
+[Two recordings of the same meeting](#two-recordings-of-the-same-meeting)),
+watch the pipeline stream live, and
 **Stop** (⌘.) any time. On completion it reveals the out-dir and opens
 `notes.md`. Build it without Xcode:
 
@@ -380,21 +477,11 @@ scripts/build_dropmemo.sh --install   # also replace /Applications/DropMemo.app
 It registers as a handler for `.m4a/.wav/.mp3`, so **Open With ▸ DropMemo** and
 dropping a memo on its Dock icon both work.
 
-The **context** box has a mic button: click it to dictate the description of the
-call instead of typing it, click again (or stop talking) to finish. Words land in
-the box as you speak, appended to whatever is already there, and the border turns
-red while it is listening.
-
-Recognition is **on-device only** (`requiresOnDeviceRecognition`), in your
-system language, and the app refuses to dictate rather than fall back to Apple's
-servers. If it tells you there is no on-device model for your language, add it
-under **System Settings ▸ Keyboard ▸ Dictation ▸ Edit Languages** and reopen the
-app. Note that `nl-NL` has no offline model by default, and that the **Lang**
-field is deliberately *not* used here: that one describes the recording, this box
-is your own note about it.
-
-First click prompts for Microphone and Speech Recognition. Because the app is
-ad-hoc signed, macOS may re-prompt after a rebuild.
+The **context** box has a mic button: click it, say what the call is about, click
+again to stop. The note is transcribed on this Mac with the same speech model the
+pipeline uses and appended to whatever is already in the box; nothing leaves the
+machine. First click prompts for Microphone access. Because the app is ad-hoc
+signed, macOS may re-prompt after a rebuild.
 
 **Shortcut (no Xcode needed)** — make a Shortcut that **Receives audio**, then
 **Run Shell Script** with:

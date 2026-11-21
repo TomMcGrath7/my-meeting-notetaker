@@ -7,12 +7,16 @@ Pipeline (each stage runs alone, so peak RAM ~= the single biggest model):
     audio.m4a
       └─ (optional) speech denoise          -> clean.wav
       └─ speech diarize --json              -> who spoke when   (turns)
-      └─ speech align                       -> word timestamps  (words)
+      └─ speech vad                         -> where the speech is
+      └─ speech align, speech only          -> word timestamps  (words)
       └─ bucket words into turns            -> speaker segments  [local]
       └─ LLM: map SPEAKER_xx -> real names, flag low-confidence  [text only]
+      └─ LLM: English transcript, if the memo isn't English      [text only]
       └─ LLM: meeting notes (summary / decisions / actions)      [text only]
+      └─ (--second) a second recording of the same meeting, lined up on the
+         words and merged; LLM: where the two disagree           [text only]
 
-Only TEXT ever leaves the device (the two LLM steps). Audio + diarization +
+Only TEXT ever leaves the device (the LLM steps). Audio + diarization +
 ASR are 100% local via the `speech` binary (github.com/soniqo/speech-swift).
 Point --llm-backend at a local model (ollama, or openai for any other
 OpenAI-compatible server) to keep it ALL local.
@@ -252,58 +256,199 @@ class AlignmentCollapse(RuntimeError):
     i.e. the aligner piled a chunk's words into the front of its window, so the
     timestamps there can't be trusted for speaker attribution."""
 
+# Second pass for force-align (plan 321). A pasted transcript is untimed, so the
+# first pass splits it by word COUNT; where the speaking rate drifts, a chunk
+# gets more text than its audio holds and the aligner crushes the excess into a
+# tail of zero-length words (the timestamp quantum is 0.08s, so "under 0.05s"
+# means zero). Those words were really spoken in the next chunk: the second pass
+# moves the text boundary to the last well-timed word, re-aligns that chunk and
+# its right neighbour only, and repeats at most REALIGN_PASSES times.
+#
+# A tail is a run of TAIL_RUN zero-length words from which the rest of the chunk
+# is packed faster than anyone speaks (TAIL_WORDS_PER_SECOND; speech is 2 to 4).
+# The rate test matters: on the EdTech call's saved run, runs of three zero
+# words sit all through healthy stretches (short words land on one 0.08s tick),
+# so "the first run of three" alone would move half of a good chunk's text.
+NEAR_ZERO_SECONDS = 0.05
+TAIL_RUN = 3
+TAIL_WORDS_PER_SECOND = 6.0
+REALIGN_PASSES = 2
+REALIGN_MAX_COVERAGE = 0.90   # a chunk already covering this much is left alone
+
+@dataclass
+class AlignChunk:
+    start: float               # where the chunk sits on the real timeline
+    length: float
+    words: list[Word]          # chunk-local times, as the aligner returned them
+    text: list[str] | None = None   # transcript words sent (force-align only)
+
+    @property
+    def coverage(self) -> float:
+        if not self.words or self.length <= 0:
+            return 0.0
+        return max(w.end for w in self.words) / self.length
+
+    @property
+    def near_zero(self) -> int:
+        return sum(1 for w in self.words if _near_zero(w))
+
+def _near_zero(w: Word) -> bool:
+    return (w.end - w.start) < NEAR_ZERO_SECONDS
+
+def collapsed_tail(words: list[Word]) -> int | None:
+    """Index of the first word of a collapsed tail, or None. Index 0 is never a
+    tail: there has to be a last well-timed word to cut after."""
+    n = len(words)
+    for k in range(1, n - TAIL_RUN + 1):
+        if not all(_near_zero(words[j]) for j in range(k, k + TAIL_RUN)):
+            continue
+        span = words[-1].end - words[k].start
+        if (n - k) >= TAIL_WORDS_PER_SECOND * span:
+            return k
+    return None
+
+def _stitch(chunks: list[AlignChunk]) -> list[Word]:
+    return [Word(text=w.text, start=w.start + c.start, end=w.end + c.start)
+            for c in chunks for w in c.words]
+
 def align_words(wav: Path, model: str, language: str | None,
                 transcript: str | None = None,
                 chunk_seconds: float = ALIGN_CHUNK_SECONDS,
                 strict: bool = False,
-                progress=None) -> list[Word]:
+                progress=None,
+                realign_passes: int = REALIGN_PASSES,
+                trace: dict | None = None) -> list[Word]:
     """Word-level timestamps for the whole file, chunking long audio (see note
     on ALIGN_CHUNK_SECONDS). With a `transcript` (e.g. exported from Voice
     Memos), each chunk is force-aligned against its share of the text, split in
-    proportion to chunk duration — best-effort, since the source text is untimed.
+    proportion to chunk duration, then re-split where a chunk's tail collapsed
+    (see REALIGN_PASSES). Best-effort, since the source text is untimed.
+
+    `trace`, when given, is filled with the chunks as pass one left them
+    ("first"), as they stand at the end ("final"), and the realign passes run
+    ("passes", a list of {chunk index: words moved}), for align_report().
     """
     dur = _wav_duration(wav)
     if dur <= chunk_seconds + 1.0:
-        return parse_align(run_align(wav, model, language, transcript))
+        words = parse_align(run_align(wav, model, language, transcript))
+        if trace is not None:
+            one = AlignChunk(0.0, dur, words,
+                             transcript.split() if transcript else None)
+            trace.update(first=[one], final=[one], passes=[])
+        return words
 
     n = int(dur // chunk_seconds) + (1 if dur % chunk_seconds else 0)
     text_words = transcript.split() if transcript else None
-    words: list[Word] = []
-    squashed = 0
     tmp = wav.parent / "_align_chunk.wav"
-    for i in range(n):
+
+    def align_chunk(i: int, a: int = 0, b: int = 0) -> AlignChunk:
         start = i * chunk_seconds
         length = min(chunk_seconds, dur - start)
         _cut_wav(wav, start, length, tmp)
-        slice_text = None
-        if text_words is not None:
-            a = (i * len(text_words)) // n
-            b = ((i + 1) * len(text_words)) // n
-            slice_text = " ".join(text_words[a:b]) or None
-        local = parse_align(run_align(tmp, model, language, slice_text))
-        # Collapse guard: a healthy chunk spreads its words across the window.
-        # When the aligner overloads it dumps everything into the front, leaving
-        # the tail empty — that scrambles speaker attribution, so flag it loudly.
-        if local and length > 30 and max(w.end for w in local) < 0.6 * length:
-            squashed += 1
-            print(f"  ⚠️  chunk {i + 1}/{n}: {len(local)} words collapsed into "
-                  f"{max(w.end for w in local):.0f}s of a {length:.0f}s window "
-                  f"— timestamps unreliable here", file=sys.stderr)
-        for w in local:
-            words.append(Word(text=w.text, start=w.start + start, end=w.end + start))
+        sent = text_words[a:b] if text_words is not None else None
+        local = parse_align(run_align(tmp, model, language,
+                                      " ".join(sent) if sent else None))
+        return AlignChunk(start, length, local, sent)
+
+    bounds = ([(i * len(text_words)) // n for i in range(n + 1)]
+              if text_words is not None else None)
+    chunks: list[AlignChunk] = []
+    total = 0
+    for i in range(n):
+        c = align_chunk(i, *(bounds[i:i + 2] if bounds else (0, 0)))
+        chunks.append(c)
+        total += len(c.words)
         if progress:
-            progress(i + 1, n, len(words))
+            progress(i + 1, n, total)
+    first = list(chunks)
+
+    passes: list[dict[int, int]] = []
+    for p in range(realign_passes if bounds else 0):
+        old = list(bounds)
+        moved: dict[int, int] = {}
+        for i, c in enumerate(chunks[:-1]):
+            if (c.text is None or len(c.words) != len(c.text)
+                    or c.coverage > REALIGN_MAX_COVERAGE):
+                continue   # healthy, or words we can't map back to the text
+            k = collapsed_tail(c.words)
+            if k is not None:
+                bounds[i + 1] = old[i] + k
+                moved[i] = len(c.words) - k
+        if not moved:
+            break
+        passes.append(moved)
+        redo = sorted({j for i in moved for j in (i, i + 1)})
+        print(f"  re-aligning chunks {', '.join(str(j + 1) for j in redo)} "
+              f"(pass {p + 1}/{realign_passes}: {sum(moved.values())} words "
+              f"from a collapsed tail moved on)")
+        for j in redo:
+            chunks[j] = align_chunk(j, bounds[j], bounds[j + 1])
+
+    # Collapse guard: a healthy chunk spreads its words across the window.
+    # When the aligner overloads it dumps everything into the front, leaving
+    # the tail empty — that scrambles speaker attribution, so flag it loudly.
+    squashed = 0
+    for i, c in enumerate(chunks):
+        if c.words and c.length > 30 and c.coverage < 0.6:
+            squashed += 1
+            print(f"  ⚠️  chunk {i + 1}/{n}: {len(c.words)} words collapsed into "
+                  f"{max(w.end for w in c.words):.0f}s of a {c.length:.0f}s window "
+                  f"— timestamps unreliable here", file=sys.stderr)
+    if trace is not None:
+        trace.update(first=first, final=chunks, passes=passes)
+    try:
+        tmp.unlink()
+    except OSError:
+        pass
     if squashed:
         print(f"  ⚠️  {squashed}/{n} chunks collapsed — try a smaller "
               f"--align-chunk (current {chunk_seconds:.0f}s)", file=sys.stderr)
         if strict:
             raise AlignmentCollapse(
                 f"{squashed}/{n} align chunks collapsed at {chunk_seconds:.0f}s")
-    try:
-        tmp.unlink()
-    except OSError:
-        pass
-    return words
+    return _stitch(chunks)
+
+def chunks_from_words(words: list[Word], dur: float,
+                      chunk_seconds: float) -> list[AlignChunk]:
+    """Rebuild a saved run's chunks (pipeline.json keeps only the stitched
+    words). A word's start says which chunk it came from, since the aligner
+    keeps to its own window; only the last chunk was seen to run past the end
+    of the audio (to 130% on the EdTech call), and it is clamped to that chunk.
+    `chunk_seconds` must be the size that run used (the EdTech call's saved run
+    was 300s, today's force-align is 120s).
+    """
+    n = max(1, int(dur // chunk_seconds) + (1 if dur % chunk_seconds else 0))
+    chunks = [AlignChunk(i * chunk_seconds, min(chunk_seconds, dur - i * chunk_seconds), [])
+              for i in range(n)]
+    for w in words:
+        i = min(n - 1, max(0, int(w.start // chunk_seconds)))
+        c = chunks[i]
+        c.words.append(Word(w.text, w.start - c.start, w.end - c.start))
+    return chunks
+
+def align_report(chunks: list[AlignChunk]) -> dict:
+    """Per chunk: words, the share under NEAR_ZERO_SECONDS, window coverage."""
+    rows = [{"chunk": i + 1, "start": c.start, "words": len(c.words),
+             "near_zero": c.near_zero,
+             "share": c.near_zero / len(c.words) if c.words else 0.0,
+             "coverage": c.coverage}
+            for i, c in enumerate(chunks)]
+    words = sum(r["words"] for r in rows)
+    near = sum(r["near_zero"] for r in rows)
+    return {"rows": rows, "words": words, "near_zero": near,
+            "share": near / words if words else 0.0,
+            "worst_coverage": min((r["coverage"] for r in rows if r["words"]),
+                                  default=0.0)}
+
+def render_align_report(rep: dict) -> str:
+    lines = ["  chunk   start  words  near-zero  coverage"]
+    for r in rep["rows"]:
+        lines.append(f"  {r['chunk']:>5}  {hhmmss(r['start']):>6}  {r['words']:>5}"
+                     f"  {r['share']:>8.1%}  {r['coverage']:>8.0%}")
+    lines.append(f"  total: {rep['words']} words, {rep['near_zero']} under "
+                 f"{NEAR_ZERO_SECONDS}s ({rep['share']:.1%}); worst chunk "
+                 f"coverage {rep['worst_coverage']:.0%}")
+    return "\n".join(lines)
 
 def parse_align(raw: str) -> list[Word]:
     # The real `speech align` output is one bracketed line per word, e.g.
@@ -331,6 +476,233 @@ def parse_align(raw: str) -> list[Word]:
             end=float(_first(w, "end", "endTime", "end_time", default=0.0)),
         ))
     return words
+
+# --------------------------------------------------------------------------- #
+# stage 3a — speech-only transcription  (speech vad, then align per chunk)
+# --------------------------------------------------------------------------- #
+
+# Qwen3-ASR derails on long silence. Measured on an 80-min Spanish phone call
+# (2026-10-23) where only one side was audible: a 300s chunk that was mostly
+# silence came back as "Sisa. SISA. Sasi. Sesses…" loops, and the last chunk as
+# an invented textbook dialogue about a market crash. The SAME audio cut to 90s
+# transcribed cleanly, and the real speech the loop had swallowed came back.
+# So by default we find the speech first, splice just the speech into chunks of
+# ~VAD_CHUNK_SECONDS (short silence between pieces), transcribe those, and map
+# every word back onto the real timeline. Silence never reaches the model.
+#
+# VAD engine: firered is ~7s on 80 min; pyannote took ~10 min for the same file.
+# firered alone found 1 min of speech in that (very quiet, ~-60 dB) recording;
+# after loudness normalisation it found ~20 min, and padded as below it covered
+# 95% of what pyannote found. The normalised copy is for detection only; the
+# ASR hears the original audio (normalising did not make its text better).
+VAD_CHUNK_SECONDS = 60.0
+VAD_PAD = 0.5           # seconds kept either side of each detected stretch
+VAD_MERGE_GAP = 1.5     # stretches closer than this are one stretch
+SPLICE_GAP = 0.4        # silence put between spliced stretches in a chunk
+VAD_NORMALISE = "dynaudnorm=f=250:g=15:m=30"
+
+def run_vad(wav: Path) -> str:
+    return sh(["speech", "vad", str(wav), "--engine", "firered", "--json"])
+
+def parse_vad(raw: str) -> list[tuple[float, float]]:
+    """`speech vad --json` → [(start, end)]. The progress lines before the JSON
+    ("[0%] Downloading…") start with '[' too; _extract_json skips them."""
+    try:
+        data = _extract_json(raw)
+    except json.JSONDecodeError:
+        return []
+    if isinstance(data, dict):
+        data = _first(data, "segments", "speech", "results", default=[])
+    out = []
+    for item in data:
+        s = float(_first(item, "start", "startTime", "start_time", default=0.0))
+        e = float(_first(item, "end", "endTime", "end_time", default=s))
+        if e > s:
+            out.append((s, e))
+    return sorted(out)
+
+def pad_regions(regions: list[tuple[float, float]], dur: float,
+                pad: float = VAD_PAD,
+                gap: float = VAD_MERGE_GAP) -> list[tuple[float, float]]:
+    """Widen each stretch by `pad` (VAD clips word edges on quiet audio) and
+    merge stretches that end up closer than `gap`."""
+    out: list[tuple[float, float]] = []
+    for s, e in sorted(regions):
+        s, e = max(0.0, s - pad), min(dur, e + pad)
+        if e <= s:      # VAD timed it past the end of the audio
+            continue
+        if out and s - out[-1][1] < gap:
+            out[-1] = (out[-1][0], max(out[-1][1], e))
+        else:
+            out.append((s, e))
+    return out
+
+@dataclass
+class Piece:
+    """One stretch of real audio inside a spliced chunk."""
+    at: float          # where it starts in the chunk
+    start: float       # where it starts in the recording
+    length: float
+
+def plan_splices(regions: list[tuple[float, float]],
+                 chunk_seconds: float = VAD_CHUNK_SECONDS,
+                 gap: float = SPLICE_GAP) -> list[list[Piece]]:
+    """Pack speech stretches into chunks of at most ~chunk_seconds of audio.
+    A stretch longer than a chunk is cut into chunk-sized pieces."""
+    if chunk_seconds <= 0:
+        raise ValueError(f"chunk_seconds must be positive, got {chunk_seconds}")
+    chunks: list[list[Piece]] = []
+    cur: list[Piece] = []
+    used = 0.0
+    for s, e in regions:
+        while e - s > 1e-6:
+            length = min(e - s, chunk_seconds)
+            need = length + (gap if cur else 0.0)
+            if cur and used + need > chunk_seconds:
+                chunks.append(cur)
+                cur, used, need = [], 0.0, length
+            cur.append(Piece(at=used + (need - length), start=s, length=length))
+            used += need
+            s += length
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+def write_splice(wav: Path, pieces: list[Piece], out: Path) -> Path:
+    """Write the pieces of `wav` back to back, `SPLICE_GAP`-ish silence between
+    (exactly as laid out by plan_splices). Same format as the source."""
+    with wave.open(str(wav), "rb") as src, wave.open(str(out), "wb") as dst:
+        dst.setparams(src.getparams())
+        rate, width, ch = src.getframerate(), src.getsampwidth(), src.getnchannels()
+        written = 0
+        for p in pieces:
+            pad = int(round(p.at * rate)) - written
+            if pad > 0:
+                dst.writeframes(b"\x00" * pad * width * ch)
+                written += pad
+            src.setpos(min(int(round(p.start * rate)), src.getnframes()))
+            frames = src.readframes(int(round(p.length * rate)))
+            dst.writeframes(frames)
+            written += len(frames) // (width * ch)
+    return out
+
+def unsplice_time(t: float, pieces: list[Piece]) -> float:
+    """Chunk time → recording time. A time in the silence between two pieces
+    belongs to the piece before it (clamped to that piece's end)."""
+    best = pieces[0]
+    for p in pieces:
+        if p.at <= t:
+            best = p
+        else:
+            break
+    return best.start + min(max(t - best.at, 0.0), best.length)
+
+def transcribe_speech(wav: Path, model: str, language: str | None,
+                      chunk_seconds: float = VAD_CHUNK_SECONDS,
+                      progress=None) -> list[Word] | None:
+    """Transcribe only the speech in `wav`. Returns None when the VAD finds no
+    speech at all, so the caller can fall back to plain chunking rather than
+    return an empty transcript for a recording that is merely very quiet."""
+    dur = _wav_duration(wav)
+    norm = wav.parent / "_vad_norm.wav"
+    try:
+        sh(["ffmpeg", "-y", "-i", str(wav), "-af", VAD_NORMALISE,
+            "-ac", "1", "-ar", "16000", "-f", "wav", str(norm)], capture=True)
+        regions = pad_regions(parse_vad(run_vad(norm)), dur)
+    finally:
+        try:
+            norm.unlink()
+        except OSError:
+            pass
+    if not regions:
+        return None
+    chunks = plan_splices(regions, chunk_seconds)
+    speech = sum(e - s for s, e in regions)
+    print(f"  speech: {speech/60:.1f} of {dur/60:.0f} min "
+          f"→ {len(chunks)} chunks of ≤{chunk_seconds:.0f}s")
+    words: list[Word] = []
+    tmp = wav.parent / "_speech_chunk.wav"
+    try:
+        for i, pieces in enumerate(chunks):
+            write_splice(wav, pieces, tmp)
+            for w in parse_align(run_align(tmp, model, language)):
+                mid = (w.start + w.end) / 2.0
+                start = unsplice_time(w.start, pieces)
+                end = unsplice_time(w.end, pieces)
+                if end < start:   # a word straddling a splice: keep it where its middle is
+                    start = end = unsplice_time(mid, pieces)
+                words.append(Word(text=w.text, start=start, end=end))
+            if progress:
+                progress(i + 1, len(chunks), len(words))
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+    return words
+
+# A backstop for the loops that still get through: a long run of short words
+# made of a handful of letters, most of them different ("Sisa. SISA. Sasi.
+# Sesses. Sosa."). Real speech repeats a WORD ("sí, sí, sí, no, sí"), which
+# has few distinct words and is kept; a loop mutates, which has many.
+#
+# Tuned on that run's 2,828 words: these cut the 202-word loop and nothing else.
+# Looser (12 words, 5 distinct) also cut "sí vamos a la misión sí vamos al",
+# which is speech. Runs of "mhm hmm" are left alone; they are cheap to read.
+LOOP_MIN_RUN = 20
+LOOP_MAX_WORD = 6       # letters, after stripping accents and punctuation
+LOOP_MAX_LETTERS = 8    # distinct letters across the whole run
+LOOP_MIN_DISTINCT = 8   # distinct words across the whole run
+LOOP_CORE = 0.6         # a loop's core letters are in this share of its words
+LOOP_MARK = "[…]"
+
+def _bare(word: str) -> str:
+    import unicodedata
+    s = unicodedata.normalize("NFKD", word.lower())
+    return "".join(c for c in s if c.isalpha())
+
+def _trim_loop(run: list[Word]) -> tuple[int, int]:
+    """Give back the real words at either edge of a candidate loop ("… Sisses.
+    Ya es el momento"): an edge word missing one of the loop's core letters
+    is not part of it. Returns the [lo, hi) slice that is the loop."""
+    if not run:
+        return 0, 0
+    bares = [set(_bare(w.text)) for w in run]
+    core = {c for c in set().union(*bares)
+            if sum(c in b for b in bares) >= LOOP_CORE * len(run)}
+    lo, hi = 0, len(run)
+    while lo < hi and not core <= bares[lo]:
+        lo += 1
+    while hi > lo and not core <= bares[hi - 1]:
+        hi -= 1
+    return lo, hi
+
+def drop_loops(words: list[Word]) -> tuple[list[Word], int]:
+    """Replace each decoder loop with one LOOP_MARK word. Returns (words, how
+    many words were dropped)."""
+    out: list[Word] = []
+    dropped = 0
+    i, n = 0, len(words)
+    while i < n:
+        j, letters = i, set()
+        while j < n:
+            b = _bare(words[j].text)
+            if len(b) > LOOP_MAX_WORD or len(letters | set(b)) > LOOP_MAX_LETTERS:
+                break
+            letters |= set(b)
+            j += 1
+        lo, hi = _trim_loop(words[i:j])
+        run = words[i + lo:i + hi]
+        if (len(run) >= LOOP_MIN_RUN
+                and len({_bare(w.text) for w in run}) >= LOOP_MIN_DISTINCT):
+            out.extend(words[i:i + lo])     # real words the trim gave back
+            out.append(Word(LOOP_MARK, run[0].start, run[-1].end))
+            dropped += len(run)
+            i += hi
+        else:
+            out.append(words[i])
+            i += 1
+    return out, dropped
 
 # --------------------------------------------------------------------------- #
 # stage 4 — merge words into speaker turns  (local, no model)
@@ -852,6 +1224,94 @@ def make_notes(segs: list[Segment], context: str, **llm_kw) -> str:
     return llm([{"role": "user", "content": user}], NOTES_SYSTEM,
                max_tokens=4000, **llm_kw)
 
+# A full English transcript of a memo in another language. Notes alone were not
+# enough: the transcript itself is what gets quoted and searched later, and a
+# translation pasted into a chat app summarised two-thirds of a call away
+# ("[The conversation continues…]"). So: numbered lines in, the same numbered
+# lines out, in batches, and a line that comes back missing is shown untranslated
+# rather than silently lost.
+TRANSLATE_SYSTEM = f"""You translate a speech-to-text transcript into English.
+
+Each input line is "[n] text". Output exactly one line per input line, "[n] English
+translation", same numbers, same order. Translate everything; never summarise,
+merge, skip or comment. Keep fillers short ("mm", "yeah"). Where the source is
+garbled and you cannot tell what was said, write [unclear] for that part rather
+than guessing. Keep names as they are. Leave {LOOP_MARK} as it is.
+
+Memos often mix languages ("¿Tienes pizza? No, I already had the pizza."): a line
+or part of a line that is already English is copied unchanged.
+
+If EVERY line is already in English, output only the word ALREADY_ENGLISH."""
+
+TRANSLATE_PIECE_WORDS = 120     # a long turn is translated in pieces this size
+TRANSLATE_BATCH_WORDS = 1500    # words per LLM call
+ALREADY_ENGLISH = "ALREADY_ENGLISH"
+_NUMBERED = re.compile(r"^\s*\[(\d+)\]\s?(.*)$")
+
+def _split_turn(text: str, limit: int = TRANSLATE_PIECE_WORDS) -> list[str]:
+    """Cut a turn into pieces of about `limit` words, at a sentence end when
+    there is one in the second half of the piece."""
+    words = text.split()
+    pieces, cur = [], []
+    for w in words:
+        cur.append(w)
+        if len(cur) >= limit or (len(cur) >= limit // 2 and _SENTENCE_END.search(w)):
+            pieces.append(" ".join(cur))
+            cur = []
+    if cur:
+        pieces.append(" ".join(cur))
+    return pieces or [""]
+
+def translate_segments(segs: list[Segment], **llm_kw) -> list[str] | None:
+    """English text for each segment, or None when the transcript is already
+    English. Each batch is asked on its own: a memo that opens in English and
+    turns to Spanish must still be translated, so one English batch keeps its
+    own lines as they are and only an all-English answer skips the file."""
+    pieces: list[tuple[int, str]] = [(i, p) for i, s in enumerate(segs)
+                                     for p in _split_turn(s.text)]
+    batches: list[list[int]] = [[]]
+    count = 0
+    for k, (_, text) in enumerate(pieces):
+        n = len(text.split())
+        if batches[-1] and count + n > TRANSLATE_BATCH_WORDS:
+            batches.append([])
+            count = 0
+        batches[-1].append(k)
+        count += n
+    english: dict[int, str] = {}
+    english_batches = 0
+    for batch in batches:
+        user = "\n".join(f"[{k}] {pieces[k][1]}" for k in batch)
+        out = llm([{"role": "user", "content": user}], TRANSLATE_SYSTEM,
+                  max_tokens=8000, **llm_kw)
+        if out.strip().strip("`*.\"' ").upper() == ALREADY_ENGLISH:
+            english_batches += 1
+            english.update((k, pieces[k][1]) for k in batch)
+            continue
+        last = None
+        for line in out.splitlines():
+            m = _NUMBERED.match(line)
+            if m:
+                # a number that is not in this batch is the model's invention,
+                # not a wrapped line of the one before it
+                last = int(m.group(1)) if int(m.group(1)) in batch else None
+                if last is not None:
+                    english[last] = m.group(2).strip()
+            elif last is not None and line.strip():
+                english[last] += " " + line.strip()   # a wrapped line
+    if english_batches == len(batches):
+        return None
+    missing = [k for k in range(len(pieces)) if k not in english]
+    if missing:
+        print(f"warning: {len(missing)} of {len(pieces)} transcript lines came back "
+              f"untranslated; they are shown in the original language.",
+              file=sys.stderr)
+    out_texts = [""] * len(segs)
+    for k, (i, text) in enumerate(pieces):
+        part = english.get(k, f"[untranslated] {text}")
+        out_texts[i] = f"{out_texts[i]} {part}".strip()
+    return out_texts
+
 # --------------------------------------------------------------------------- #
 # rendering
 # --------------------------------------------------------------------------- #
@@ -868,9 +1328,453 @@ def render_named(segs: list[Segment]) -> str:
         out.append(f"**{s.speaker}** ({hhmmss(s.start)}){mark}\n{s.text}\n")
     return "\n".join(out)
 
+def render_english(segs: list[Segment], english: list[str]) -> str:
+    head = ("_English translation of transcript_named.md, made by an LLM from the "
+            "speech-to-text. [unclear] marks what could not be made out; the "
+            "original is the reference._\n\n")
+    return head + render_named([replace(s, text=t) for s, t in zip(segs, english)])
+
+# --------------------------------------------------------------------------- #
+# two recordings of one conversation  (--second; docs/two-recordings.md)
+# --------------------------------------------------------------------------- #
+
+# The same meeting recorded on two devices. The method is the one that worked
+# by hand (docs/two-recordings.md): line the two up on their WORDS, not their
+# audio; cut one shared timeline at pauses; take the louder recording as the
+# default; and let an LLM judge, on meaning, where the two disagree, because
+# word overlap sat around 0.3 even where both plainly said the same thing.
+#
+# The numbers below are that write-up's (runs of 5 words, a pause over 1.2s
+# once a window is 8s long, a hard cut at 35s, 45 windows a call) except the
+# four marked "a choice", which it does not give.
+SYNC_MIN_RUN = 5          # a run of matching words this long gives an offset
+SYNC_TOLERANCE = 3.0      # a choice: runs within this of the median agree
+SYNC_MIN_RUNS = 3         # a choice: fewer agreeing runs is not a match
+DRIFT_MIN_SPAN = 600.0    # a choice: fit clock drift only across 10+ minutes
+WINDOW_PAUSE = 1.2
+WINDOW_MIN = 8.0
+WINDOW_MAX = 35.0
+LOUDER_MARGIN_DB = 1.0    # a choice: closer than this, the first file stays
+JUDGE_BATCH = 45
+DISAGREE_TOP = 40         # without a judge, the list is every window: cap it
+
+_MEAN_VOLUME_RE = re.compile(r"mean_volume:\s*(-?\d+(?:\.\d+)?)\s*dB")
+
+def parse_mean_volume(stderr: str) -> float | None:
+    """The mean level from ffmpeg's volumedetect ("mean_volume: -52.3 dB").
+    None for silence ("-inf") or output without the line."""
+    m = _MEAN_VOLUME_RE.search(stderr)
+    return float(m.group(1)) if m else None
+
+def mean_volume(src: Path) -> float | None:
+    need("ffmpeg")
+    proc = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-nostats", "-i", str(src), "-vn",
+         "-af", "volumedetect", "-f", "null", "-"],
+        capture_output=True, text=True)
+    return parse_mean_volume(proc.stderr or "")
+
+def louder(first_db: float | None, second_db: float | None) -> str:
+    """Which recording is the default: "second" only when it is measurably
+    louder. An unmeasured level never moves the default off the first file."""
+    if first_db is None or second_db is None:
+        return "first"
+    return "second" if second_db - first_db > LOUDER_MARGIN_DB else "first"
+
+def _word_key(text: str) -> str:
+    """A word as the matcher sees it: lower-cased, accents and punctuation
+    stripped. Unlike _bare it keeps digits ("2024" is a word)."""
+    import unicodedata
+    s = unicodedata.normalize("NFKD", text.lower())
+    return "".join(c for c in s if c.isalnum())
+
+def _keyed(words: list[Word]) -> list[tuple[str, Word]]:
+    return [(k, w) for w in words for k in [_word_key(w.text)] if k]
+
+@dataclass
+class Sync:
+    """How the second recording's clock maps onto the primary's:
+    t_second = t_primary + offset + drift * t_primary. A positive offset means
+    the second recording started earlier."""
+    offset: float
+    drift: float       # seconds gained per second of recording
+    runs: int          # matching runs of SYNC_MIN_RUN words
+    agreeing: int      # of those, how many sit within SYNC_TOLERANCE
+
+    def to_primary(self, t: float) -> float:
+        return (t - self.offset) / (1.0 + self.drift)
+
+    def to_second(self, t: float) -> float:
+        return t + self.offset + self.drift * t
+
+def sync_recordings(a: list[Word], b: list[Word]) -> Sync | None:
+    """Line two transcripts of one conversation up on their words. None when
+    they do not look like the same conversation: fewer than SYNC_MIN_RUNS
+    matching runs of SYNC_MIN_RUN words agree on an offset, or most runs
+    disagree with it."""
+    import difflib
+    ka, kb = _keyed(a), _keyed(b)
+    sm = difflib.SequenceMatcher(None, [k for k, _ in ka], [k for k, _ in kb])
+    points: list[tuple[float, float]] = []      # (primary time, offset there)
+    for i, j, n in sm.get_matching_blocks():
+        # A long block counts once per SYNC_MIN_RUN words: two clean
+        # transcripts match as ONE block, and that is the best case, not one
+        # weak run. It also gives the drift fit points along the block.
+        for x in range(0, n - SYNC_MIN_RUN + 1, SYNC_MIN_RUN):
+            diffs = sorted(kb[j + x + y][1].start - ka[i + x + y][1].start
+                           for y in range(SYNC_MIN_RUN))
+            points.append((ka[i + x][1].start, diffs[SYNC_MIN_RUN // 2]))
+    if not points:
+        return None
+    offsets = sorted(o for _, o in points)
+    mid = offsets[len(offsets) // 2]
+    good = [p for p in points if abs(p[1] - mid) <= SYNC_TOLERANCE]
+    if len(good) < SYNC_MIN_RUNS or len(good) * 2 < len(points):
+        return None
+    offset, drift = mid, 0.0
+    ts = [t for t, _ in good]
+    if max(ts) - min(ts) >= DRIFT_MIN_SPAN:
+        mt = sum(ts) / len(ts)
+        mo = sum(o for _, o in good) / len(good)
+        var = sum((t - mt) ** 2 for t in ts)
+        drift = sum((t - mt) * (o - mo) for t, o in good) / var
+        offset = mo - drift * mt
+    return Sync(offset=offset, drift=drift, runs=len(points), agreeing=len(good))
+
+def onto_primary(words: list[Word], sync: Sync) -> list[Word]:
+    return [Word(w.text, sync.to_primary(w.start), sync.to_primary(w.end))
+            for w in words]
+
+@dataclass
+class MergeWindow:
+    """One stretch of the shared timeline (primary's clock) and what each
+    recording has in it. `a` is the primary."""
+    start: float
+    end: float
+    a: str = ""
+    b: str = ""
+    a_at: float | None = None      # middle of the primary's first word here
+    overlap: float | None = None   # word-overlap ratio, when both have text
+    verdict: str = ""              # same | differ | unclear, from the judge
+    note: str = ""
+
+def _join_words(words: list[Word]) -> str:
+    return re.sub(r"\s+([,.;:!?])", r"\1", " ".join(w.text for w in words)).strip()
+
+def _overlap(a: str, b: str) -> float:
+    import difflib
+    return difflib.SequenceMatcher(
+        None, [k for k in map(_word_key, a.split()) if k],
+        [k for k in map(_word_key, b.split()) if k], autojunk=False).ratio()
+
+def merge_windows(a: list[Word], b: list[Word]) -> list[MergeWindow]:
+    """Cut the shared timeline at pauses and pair the two recordings window by
+    window. `b` must already be on the primary's clock (onto_primary). A window
+    ends at a pause over WINDOW_PAUSE in BOTH recordings once it is WINDOW_MIN
+    long, and at WINDOW_MAX regardless."""
+    tagged = sorted([(w.start, 0, w) for w in a] + [(w.start, 1, w) for w in b],
+                    key=lambda x: (x[0], x[1]))
+    out: list[MergeWindow] = []
+    sides: list[list[Word]] = [[], []]
+    win_start = last_end = 0.0
+
+    def close():
+        wa, wb = sides
+        w = MergeWindow(start=win_start, end=last_end,
+                        a=_join_words(wa), b=_join_words(wb),
+                        a_at=(wa[0].start + wa[0].end) / 2.0 if wa else None)
+        if w.a and w.b:
+            w.overlap = _overlap(w.a, w.b)
+        out.append(w)
+
+    for start, side, w in tagged:
+        if sides[0] or sides[1]:
+            paused = (start - last_end > WINDOW_PAUSE
+                      and last_end - win_start >= WINDOW_MIN)
+            if paused or start - win_start >= WINDOW_MAX:
+                close()
+                sides = [[], []]
+        if not (sides[0] or sides[1]):
+            win_start, last_end = start, max(start, w.end)
+        sides[side].append(w)
+        last_end = max(last_end, w.end)
+    if sides[0] or sides[1]:
+        close()
+    return out
+
+JUDGE_SYSTEM = """Two devices recorded the same conversation, and each recording was
+transcribed on its own by speech-to-text. You get stretches of it as a JSON array of
+{"id": n, "a": "...", "b": "..."}, where "a" and "b" are the two transcripts of the
+same moment.
+
+For each id, decide whether a and b say the same thing:
+- "same": the same meaning. Spelling, punctuation, fillers, a misheard word that does
+  not change what was said, and a few words missing at either edge (the stretches are
+  cut by time, not by sentence) are NOT differences.
+- "differ": they say different things: a different name, number, word or claim, or one
+  has a sentence the other lacks.
+- "unclear": one or both are too garbled to tell.
+
+Judge only what is written. Do not correct, complete or translate either transcript.
+
+Respond with ONLY a JSON array, one object per id, no prose, no markdown fences:
+[{"id": 0, "verdict": "same", "note": ""},
+ {"id": 1, "verdict": "differ", "note": "what differs, in a few words"}]"""
+
+_VERDICTS = ("same", "differ", "unclear")
+
+def judge_windows(windows: list[MergeWindow], **llm_kw) -> int:
+    """Ask the LLM, JUDGE_BATCH windows a call, whether the two recordings say
+    the same thing in each window that both have text for. Fills verdict and
+    note in place. Every batch is checked for every id; returns how many
+    windows came back without a usable verdict (they stay unjudged)."""
+    ids = [i for i, w in enumerate(windows) if w.a and w.b]
+    missing = 0
+    for at in range(0, len(ids), JUDGE_BATCH):
+        batch = ids[at:at + JUDGE_BATCH]
+        user = json.dumps([{"id": i, "a": windows[i].a, "b": windows[i].b}
+                           for i in batch], ensure_ascii=False)
+        out = llm([{"role": "user", "content": user}], JUDGE_SYSTEM,
+                  max_tokens=4000, **llm_kw)
+        try:
+            data = _extract_json(out)
+        except json.JSONDecodeError:
+            data = []
+        if isinstance(data, dict):
+            data = _first(data, "results", "verdicts", "windows", default=[data])
+        got = set()
+        for item in data if isinstance(data, list) else []:
+            if not isinstance(item, dict):
+                continue
+            i, verdict = item.get("id"), str(item.get("verdict", "")).strip().lower()
+            if isinstance(i, int) and i in batch and verdict in _VERDICTS:
+                windows[i].verdict = verdict
+                windows[i].note = str(item.get("note") or "").strip()
+                got.add(i)
+        missing += len(batch) - len(got)
+    if missing:
+        print(f"warning: {missing} of {len(ids)} windows came back from the LLM "
+              f"without a verdict; they are ranked by word overlap instead.",
+              file=sys.stderr)
+    return missing
+
+def rank_disagreements(windows: list[MergeWindow]) -> list[MergeWindow]:
+    """The windows where the two recordings disagree, worst first. With a
+    judge: every window it did not call "same" ("differ", then the ones it
+    left unjudged, then "unclear"), least word overlap first within each.
+    Without one, word overlap is all there is, and since it is a poor test
+    (about 0.3 even in agreement) only the DISAGREE_TOP lowest are listed."""
+    both = [w for w in windows if w.a and w.b]
+    if any(w.verdict for w in both):
+        order = {"differ": 0, "": 1, "unclear": 2}
+        pool = [w for w in both if w.verdict != "same"]
+        return sorted(pool, key=lambda w: (order[w.verdict], w.overlap or 0.0))
+    return sorted(both, key=lambda w: w.overlap or 0.0)[:DISAGREE_TOP]
+
+def phrase_diff(a: str, b: str) -> list[tuple[str, str]]:
+    """The two texts phrase by phrase: [(a_phrase, b_phrase)], equal where both
+    recordings have the same words (compared without case, accents or
+    punctuation; the primary's spelling is shown), and "" on the side that
+    has nothing there."""
+    import difflib
+    wa = [w for w in a.split() if _word_key(w)]
+    wb = [w for w in b.split() if _word_key(w)]
+    sm = difflib.SequenceMatcher(None, [_word_key(w) for w in wa],
+                                 [_word_key(w) for w in wb], autojunk=False)
+    out = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        pa, pb = " ".join(wa[i1:i2]), " ".join(wb[j1:j2])
+        out.append((pa, pa) if tag == "equal" else (pa, pb))
+    return out
+
+def signed_hhmmss(t: float) -> str:
+    """hhmmss, for a time that may fall before the primary recording began."""
+    return hhmmss(t) if t > -1.0 else "-" + hhmmss(-t)
+
+def _primary_span(windows: list[MergeWindow]) -> tuple[float, float]:
+    has = [w for w in windows if w.a]
+    return (has[0].start, has[-1].end) if has else (0.0, 0.0)
+
+def render_merged(windows: list[MergeWindow], segs: list[Segment],
+                  a_name: str, b_name: str) -> str:
+    """One transcript from both recordings. The primary (A) is the text. B
+    fills the stretches A has nothing for, marked as B's, and is shown as a
+    small "B heard:" line only where the judge said the two differ: showing
+    both wherever they are not identical floods the page."""
+    turns = [Turn(s.speaker, s.start, s.end) for s in segs]
+    lo, hi = _primary_span(windows)
+    head = (f"_Merged from two recordings of one conversation. A = {a_name} "
+            f"(the default), B = {b_name}. Times are A's clock. Text is A's; "
+            f"\"B only\" is what A has nothing for, and \"B heard\" is where "
+            f"the two differ (see disagreements.md)._\n\n")
+    blocks: list[dict] = []
+    for w in windows:
+        if w.a:
+            key, text = _turn_for(w.a_at, turns) if turns else "A", w.a
+            b_line = w.b if w.verdict == "differ" else ""
+        else:
+            # B is the quieter recording, and a quiet recording invents fluent
+            # text where it cannot hear, so B alone inside A's span is doubtful.
+            inside = lo <= w.start <= hi
+            key = ("B only ⚠️ unconfirmed: A was recording and has nothing here"
+                   if inside else "B only")
+            text, b_line = w.b, ""
+        # Agreeing windows of one speaker run together. A window with a B line
+        # stands alone, so the line sits under exactly the text it answers.
+        if (blocks and blocks[-1]["key"] == key and not blocks[-1]["b"]
+                and not b_line):
+            blocks[-1]["text"] += " " + text
+            continue
+        why = f" ({w.note})" if w.note else ""
+        blocks.append({"key": key, "start": w.start, "text": text,
+                       "b": f"> B heard{why}: {b_line}\n" if b_line else ""})
+    return head + "\n".join(
+        f"**{k['key']}** ({signed_hhmmss(k['start'])})\n{k['text']}\n{k['b']}"
+        for k in blocks)
+
+def render_disagreements(windows: list[MergeWindow], sync: Sync,
+                         a_name: str, b_name: str) -> str:
+    both = [w for w in windows if w.a and w.b]
+    judged = any(w.verdict for w in both)
+    ranked = rank_disagreements(windows)
+    lo, hi = _primary_span(windows)
+    b_only = [w for w in windows if w.b and not w.a]
+    b_inside = [w for w in b_only if lo <= w.start <= hi]
+    a_only = sum(1 for w in windows if w.a and not w.b)
+    out = ["# Where the two recordings disagree", "",
+           f"A = {a_name} (the default), B = {b_name}.", "",
+           f"- Aligned on words: {sync.agreeing} of {sync.runs} matching runs "
+           f"agree on an offset of {sync.offset:.1f}s (positive: B started "
+           f"first), drift {sync.drift * 3600:.2f}s an hour.",
+           f"- {len(windows)} windows: {len(both)} heard by both, {a_only} by "
+           f"A only, {len(b_only)} by B only."]
+    if judged:
+        counts = {v: sum(1 for w in both if w.verdict == v) for v in _VERDICTS}
+        left = len(both) - sum(counts.values())
+        out.append(f"- Judged on meaning by the LLM: {counts['same']} same, "
+                   f"{counts['differ']} differ, {counts['unclear']} unclear"
+                   + (f", {left} not judged" if left else "") + ".")
+    else:
+        out.append(f"- Not judged on meaning (no LLM pass), so this is the "
+                   f"{len(ranked)} windows with the least word overlap. Word "
+                   f"overlap is a poor test: it is low even where both "
+                   f"recordings say the same thing.")
+    out += ["", "## Ranked, worst first", ""]
+    if not ranked:
+        out.append("Nothing to show: no window was judged different.\n")
+    for n, w in enumerate(ranked, 1):
+        label = w.verdict or "not judged"
+        note = f": {w.note}" if w.note else ""
+        out.append(f"### {n}. A {signed_hhmmss(w.start)} / B "
+                   f"{signed_hhmmss(sync.to_second(w.start))} ({label}{note}; "
+                   f"word overlap {w.overlap:.2f})")
+        out.append("")
+        for pa, pb in phrase_diff(w.a, w.b):
+            if pa == pb:
+                out.append(f"- both: {pa}")
+            else:
+                out.append(f"- A: {pa or '(nothing)'}")
+                out.append(f"  B: {pb or '(nothing)'}")
+        out.append("")
+    if b_inside:
+        out += ["## Heard by B only, while A was recording", "",
+                "A quiet recording invents fluent text where it cannot hear, "
+                "so check these against the audio before relying on them.", ""]
+        out += [f"- B {signed_hhmmss(sync.to_second(w.start))} (A "
+                f"{signed_hhmmss(w.start)}): {w.b}" for w in b_inside]
+        out.append("")
+    return "\n".join(out)
+
+def second_recording_words(src: Path, out_dir: Path, args) -> list[Word]:
+    """The second recording's words on its own clock. A pipeline.json from an
+    earlier run is read as it is; audio is transcribed the way the first
+    recording is (speech only, loops dropped). It is never diarized: speakers
+    come from the primary."""
+    if src.suffix.lower() == ".json":
+        return Pipeline.from_json(src.read_text()).words
+    need("speech")
+    wav = to_wav16k(src, out_dir / "audio2.wav")
+    if args.denoise:
+        wav = denoise(wav, out_dir / "audio2.clean.wav")
+    progress = lambda i, n, t: print(f"  chunk {i}/{n} … {t} words")
+    words = None
+    if not args.no_vad:
+        words = transcribe_speech(wav, args.model, args.language,
+                                  chunk_seconds=args.vad_chunk, progress=progress)
+    if words is None:
+        words = align_words(wav, args.model, args.language,
+                            chunk_seconds=args.align_chunk or ALIGN_CHUNK_SECONDS,
+                            progress=progress)
+    words, dropped = drop_loops(words)
+    if dropped:
+        print(f"  dropped {dropped} words of decoder loop (marked {LOOP_MARK})")
+    (out_dir / "second.json").write_text(
+        Pipeline(audio=str(src), words=words).to_json())
+    return words
+
+def merge_second(pipe: Pipeline, b_words: list[Word], b_name: str,
+                 out_dir: Path, judge: bool, **llm_kw) -> bool:
+    """Align the second recording to the primary and write
+    transcript_merged.md, disagreements.md and merge.json. False (and nothing
+    written) when the two cannot be lined up."""
+    a_name = Path(pipe.audio).name
+    sync = sync_recordings(pipe.words, b_words) if pipe.words and b_words else None
+    if sync is None:
+        print(f"warning: could not line {b_name} up with {a_name}: too few "
+              f"runs of {SYNC_MIN_RUN} matching words agree on an offset, so "
+              f"these do not look like the same conversation (or one "
+              f"transcript is empty). Nothing was merged; the outputs above "
+              f"are from {a_name} alone.", file=sys.stderr)
+        return False
+    print(f"  aligned on words: {sync.agreeing} of {sync.runs} matching runs "
+          f"agree; offset {sync.offset:.1f}s, drift {sync.drift * 3600:.2f}s/hour")
+    windows = merge_windows(pipe.words, onto_primary(b_words, sync))
+    both = sum(1 for w in windows if w.a and w.b)
+    print(f"  {len(windows)} windows, {both} heard by both recordings")
+    if judge and both:
+        print("• judging where the two recordings disagree via LLM…")
+        judge_windows(windows, **llm_kw)
+    (out_dir / "transcript_merged.md").write_text(
+        render_merged(windows, pipe.segments, a_name, b_name))
+    (out_dir / "disagreements.md").write_text(
+        render_disagreements(windows, sync, a_name, b_name))
+    (out_dir / "merge.json").write_text(json.dumps(
+        {"primary": pipe.audio, "second": b_name, "sync": asdict(sync),
+         "windows": [asdict(w) for w in windows]}, indent=2, ensure_ascii=False))
+    return True
+
 # --------------------------------------------------------------------------- #
 # commands
 # --------------------------------------------------------------------------- #
+
+def print_align_trace(trace: dict, turns: list[Turn]) -> None:
+    """The --align-report block: per-chunk table as the run ends, and the two
+    numbers plan 321's decision rule reads, before and after the second pass
+    (near-zero share, and segments after tidy_segments, labels still raw)."""
+    if not trace.get("final"):
+        return
+    print("• align report (after the realign passes)")
+    print(render_align_report(align_report(trace["final"])))
+    first, final = align_report(trace["first"]), align_report(trace["final"])
+    segs = lambda chunks: len(tidy_segments(merge(_stitch(chunks), turns)))
+    moved = sum(sum(p.values()) for p in trace.get("passes", []))
+    print(f"  pass one: {first['share']:.1%} near-zero, "
+          f"{segs(trace['first'])} segments after tidy")
+    print(f"  final:    {final['share']:.1%} near-zero, "
+          f"{segs(trace['final'])} segments after tidy "
+          f"({len(trace.get('passes', []))} realign pass(es), {moved} words moved)")
+
+def cmd_align_report(args):
+    """Per-chunk near-zero share and coverage for a saved pipeline.json."""
+    path = Path(args.pipeline)
+    pipe = Pipeline.from_json(path.read_text())
+    if not pipe.words:
+        sys.exit(f"error: {path} has no words")
+    wav = Path(args.audio) if args.audio else path.parent / "audio.wav"
+    dur = _wav_duration(wav) if wav.exists() else max(w.end for w in pipe.words)
+    print(f"{path}: {dur/60:.0f} min at {args.align_chunk:.0f}s chunks")
+    print(render_align_report(align_report(
+        chunks_from_words(pipe.words, dur, args.align_chunk))))
 
 def cmd_check(args):
     """Run diarize + align on a file and show raw vs parsed, to verify schemas."""
@@ -931,6 +1835,24 @@ def resolve_num_ctx_max(flag, cfg: dict) -> int:
         return cap
     return DEFAULT_NUM_CTX_MAX
 
+def pick_primary(first: Path, second: Path, choice: str,
+                 has_transcript: bool) -> tuple[Path, Path]:
+    """(primary, other) for two audio files. The louder one is the default
+    (it was right far more often), unless --primary says otherwise. A provided
+    transcript belongs to the first file, so it pins the first as primary."""
+    if has_transcript and choice != "first":
+        print("• two recordings: the first is the default, since --transcript "
+              "is aligned to it")
+        return first, second
+    if choice == "louder":
+        a, b = mean_volume(first), mean_volume(second)
+        choice = louder(a, b)
+        level = lambda v: "unmeasured" if v is None else f"{v:.1f} dB"
+        print(f"• two recordings: {first.name} {level(a)}, {second.name} "
+              f"{level(b)} → {(first if choice == 'first' else second).name} "
+              f"is the default")
+    return (first, second) if choice == "first" else (second, first)
+
 def cmd_run(args):
     cfg = load_config(Path(args.config))
     roster = cfg.get("participants", [])
@@ -941,11 +1863,24 @@ def cmd_run(args):
                   base_url=args.base_url or DEFAULT_BASE_URLS.get(args.llm_backend, ""),
                   num_ctx_max=resolve_num_ctx_max(args.num_ctx_max, cfg))
 
+    second = Path(args.second) if args.second else None
+    if second and not second.is_file():
+        sys.exit(f"error: --second file not found: {second}")
+    both_audio = bool(second and not args.from_json
+                      and second.suffix.lower() != ".json")
+    if second and args.primary == "second" and not both_audio:
+        sys.exit("error: --primary second needs two audio files. With a "
+                 "pipeline.json on either side, the first one is the default: "
+                 "swap the two instead.")
+
     if args.from_json:
         pipe = Pipeline.from_json(Path(args.from_json).read_text())
     else:
         need("speech")
         src = Path(args.file)
+        if both_audio:
+            src, second = pick_primary(src, second, args.primary,
+                                       bool(args.transcript))
         wav = to_wav16k(src, out_dir / "audio.wav")
         if args.denoise:
             print("• denoising…")
@@ -964,22 +1899,47 @@ def cmd_run(args):
         align_chunk = args.align_chunk or (
             ALIGN_CHUNK_SECONDS_FORCED if transcript_text else ALIGN_CHUNK_SECONDS)
         dur = _wav_duration(wav)
-        if dur > align_chunk + 1.0:
+        fixed_chunks = bool(transcript_text) or args.no_vad
+        if fixed_chunks and dur > align_chunk + 1.0:
             n = int(dur // align_chunk) + (1 if dur % align_chunk else 0)
             mode = "forced-align" if transcript_text else "transcribe"
             print(f"• aligning words… ({dur/60:.0f} min → {n} chunks, "
                   f"{align_chunk:.0f}s, {mode})")
-        else:
+        elif fixed_chunks:
             print("• aligning words…")
-        try:
-            words = align_words(wav, args.model, args.language,
-                                transcript=transcript_text,
-                                chunk_seconds=align_chunk,
-                                strict=args.strict,
-                                progress=lambda i, n, t: print(f"  chunk {i}/{n} … {t} words"))
-        except AlignmentCollapse as e:
-            sys.exit(f"error: {e}. Re-run with a smaller --align-chunk, or drop "
-                     f"--strict to accept the unreliable timestamps.")
+        progress = lambda i, n, t: print(f"  chunk {i}/{n} … {t} words")
+        words = None
+        # Speech-only is the default when transcribing. A provided transcript
+        # is split across chunks by duration, which only holds on the plain
+        # timeline, so --transcript (and --no-vad) keep the fixed chunks.
+        if not fixed_chunks:
+            print("• finding speech…")
+            words = transcribe_speech(wav, args.model, args.language,
+                                      chunk_seconds=args.vad_chunk,
+                                      progress=progress)
+            if words is None:
+                print("  no speech found by the VAD; transcribing the whole file")
+        if words is None:
+            trace: dict = {}
+            try:
+                words = align_words(wav, args.model, args.language,
+                                    transcript=transcript_text,
+                                    chunk_seconds=align_chunk,
+                                    strict=args.strict,
+                                    progress=progress,
+                                    realign_passes=args.realign_passes,
+                                    trace=trace)
+            except AlignmentCollapse as e:
+                if args.align_report:
+                    print_align_trace(trace, turns)
+                sys.exit(f"error: {e}. Re-run with a smaller --align-chunk, or drop "
+                         f"--strict to accept the unreliable timestamps.")
+            if args.align_report:
+                print_align_trace(trace, turns)
+        if not transcript_text:
+            words, dropped = drop_loops(words)
+            if dropped:
+                print(f"  dropped {dropped} words of decoder loop (marked {LOOP_MARK})")
         print(f"  {len(words)} words")
         if not turns or not words:
             sys.exit("error: diarization or alignment produced nothing. "
@@ -989,6 +1949,14 @@ def cmd_run(args):
 
     if not pipe.segments:
         pipe.segments = merge(pipe.words, pipe.turns)
+
+    # The second recording's audio work happens here, before any LLM step, so
+    # the ASR model is never resident beside a local LLM.
+    b_words = None
+    if second:
+        print(f"• second recording: {second.name}")
+        b_words = second_recording_words(second, out_dir, args)
+        print(f"  {len(b_words)} words")
 
     if roster:
         print("• attributing speakers via LLM…")
@@ -1020,13 +1988,34 @@ def cmd_run(args):
     (out_dir / "transcript_named.md").write_text(render_named(pipe.segments))
     (out_dir / "pipeline.json").write_text(pipe.to_json())
 
+    english = None
+    if not args.no_translate and not (args.language or "").lower().startswith("en"):
+        print("• translating the transcript to English via LLM…")
+        english = translate_segments(pipe.segments, **llm_kw)
+        if english is None:
+            print("  already English; no translation written")
+        else:
+            (out_dir / "transcript_en.md").write_text(
+                render_english(pipe.segments, english))
+
     if not args.no_notes:
         print("• writing notes via LLM…")
         notes = make_notes(pipe.segments, context, **llm_kw)
         (out_dir / "notes.md").write_text(notes)
 
+    merged = False
+    if second:
+        print("• merging the two recordings…")
+        merged = merge_second(pipe, b_words, second.name, out_dir,
+                              judge=not args.no_judge, **llm_kw)
+
     print(f"\n✓ done → {out_dir}/")
     print("  transcript_named.md   speaker-attributed transcript")
+    if english is not None:
+        print("  transcript_en.md      the same transcript in English")
+    if merged:
+        print("  transcript_merged.md  both recordings as one transcript")
+        print("  disagreements.md      where the two recordings disagree, ranked")
     print("  pipeline.json         all intermediates (reuse with --from-json)")
     if not args.no_notes:
         print("  notes.md              summary / decisions / action items")
@@ -1061,6 +2050,18 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("file")
     c.set_defaults(func=cmd_check)
 
+    a = sub.add_parser("align-report",
+                       help="per-chunk near-zero share + coverage of a saved run")
+    a.add_argument("pipeline", help="a run's pipeline.json")
+    a.add_argument("--align-chunk", type=float, default=ALIGN_CHUNK_SECONDS_FORCED,
+                   help=f"the chunk size that run aligned with (default "
+                        f"{int(ALIGN_CHUNK_SECONDS_FORCED)}; out-20260702-001651 "
+                        f"used 300)")
+    a.add_argument("--audio", default=None,
+                   help="the run's wav, for its length (default audio.wav beside "
+                        "the json; else the last word's end)")
+    a.set_defaults(func=cmd_align_report)
+
     r = sub.add_parser("run", parents=[common], help="full pipeline")
     r.add_argument("file", nargs="?", help="audio file (m4a/wav/mp3/caf)")
     r.add_argument("--config", default="config.yaml",
@@ -1073,6 +2074,21 @@ def build_parser() -> argparse.ArgumentParser:
                         "Voice Memos); force-align THIS text to the audio instead "
                         "of transcribing. Better text, but best-effort across "
                         "chunks since the source text is untimed.")
+    r.add_argument("--second",
+                   help="a second recording of the SAME meeting (another phone "
+                        "or laptop): audio, or the pipeline.json of an earlier "
+                        "run of it. It is lined up with the first on the words, "
+                        "and the run also writes transcript_merged.md and "
+                        "disagreements.md. See docs/two-recordings.md.")
+    r.add_argument("--primary", choices=["louder", "first", "second"],
+                   default="louder",
+                   help="with --second: which recording is the default text and "
+                        "gets the speakers and notes (default: the louder one; "
+                        "the first when --transcript or a pipeline.json is used)")
+    r.add_argument("--no-judge", action="store_true",
+                   help="with --second: skip the LLM pass that judges, on "
+                        "meaning, where the two recordings disagree, and rank "
+                        "by word overlap alone (a poor test)")
     r.add_argument("--align-chunk", type=float, default=None,
                    help=f"seconds of audio per alignment chunk (default "
                         f"{int(ALIGN_CHUNK_SECONDS)} transcribing, "
@@ -1080,9 +2096,27 @@ def build_parser() -> argparse.ArgumentParser:
                         f"the forced aligner overloads on longer chunks). speech "
                         f"align only handles a few minutes per call, so long files "
                         f"are chunked + stitched.")
+    r.add_argument("--no-vad", action="store_true",
+                   help="transcribe the whole file in fixed --align-chunk windows, "
+                        "silence included (the old behaviour). By default only "
+                        "the speech is transcribed, since long silence makes the "
+                        "ASR loop or invent text.")
+    r.add_argument("--vad-chunk", type=float, default=VAD_CHUNK_SECONDS,
+                   help=f"seconds of speech per ASR call when transcribing speech "
+                        f"only (default {int(VAD_CHUNK_SECONDS)})")
+    r.add_argument("--no-translate", action="store_true",
+                   help="skip transcript_en.md, the English translation written "
+                        "when the memo is not in English")
     r.add_argument("--strict", action="store_true",
                    help="fail the run (non-zero exit) if any alignment chunk "
                         "collapses, instead of emitting a warning and continuing")
+    r.add_argument("--realign-passes", type=int, default=REALIGN_PASSES,
+                   help=f"with --transcript: times a chunk whose tail collapsed "
+                        f"gets its text boundary moved and is re-aligned with its "
+                        f"right neighbour (default {REALIGN_PASSES}; 0 = off)")
+    r.add_argument("--align-report", action="store_true",
+                   help="print per-chunk word counts, near-zero share and window "
+                        "coverage after aligning, before and after the realign pass")
     r.add_argument("--no-notes", action="store_true",
                    help="skip the notes-generation LLM step")
     r.add_argument("--from-json",

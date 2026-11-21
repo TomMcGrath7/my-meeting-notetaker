@@ -16,7 +16,6 @@ import AppKit
 import Darwin
 import UniformTypeIdentifiers
 import AVFoundation
-import Speech
 
 // MARK: - Where the repo (and thus process.sh + config.yaml) lives
 
@@ -77,127 +76,6 @@ enum DiarizeEngine: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
-// MARK: - Dictation: speak the meeting context instead of typing it
-
-/// On-device speech → text for the context field. Deliberately **on-device
-/// only**: `requiresOnDeviceRecognition` is forced on, and if the locale has no
-/// local model we refuse and say so rather than quietly streaming meeting
-/// context to Apple's servers. This app exists so recordings never leave the
-/// Mac; the box you describe them in should hold to the same rule.
-@MainActor
-final class Dictation: ObservableObject {
-    @Published private(set) var isListening = false
-    /// Last thing worth telling the user (denied permission, no local model…).
-    @Published var note: String?
-
-    private let engine = AVAudioEngine()
-    private var request: SFSpeechAudioBufferRecognitionRequest?
-    private var task: SFSpeechRecognitionTask?
-    /// What the field held when we started. Partial results are appended to
-    /// this, so a re-transcription replaces the guess instead of doubling it.
-    private var base = ""
-    private var emit: ((String) -> Void)?
-
-    /// The locale to dictate in. Deliberately the **system** locale, not the
-    /// app's Lang field: Lang describes the recording, while this box is Tom's
-    /// own note about it, and the two are routinely different languages.
-    static var locale: Locale { Locale.current }
-
-    func toggle(current: String, emit: @escaping (String) -> Void) {
-        if isListening { stop() } else { start(current: current, emit: emit) }
-    }
-
-    private func start(current: String, emit: @escaping (String) -> Void) {
-        note = nil
-        self.base = current
-        self.emit = emit
-        // Both prompts are TCC-backed; NSMicrophoneUsageDescription and
-        // NSSpeechRecognitionUsageDescription must be in Info.plist or the
-        // request traps instead of asking.
-        SFSpeechRecognizer.requestAuthorization { auth in
-            Task { @MainActor in
-                guard auth == .authorized else {
-                    self.note = "Speech recognition not allowed (System Settings ▸ Privacy & Security ▸ Speech Recognition)."
-                    return
-                }
-                let granted = await AVCaptureDevice.requestAccess(for: .audio)
-                guard granted else {
-                    self.note = "Microphone not allowed (System Settings ▸ Privacy & Security ▸ Microphone)."
-                    return
-                }
-                self.listen()
-            }
-        }
-    }
-
-    private func listen() {
-        let loc = Self.locale
-        let name = loc.identifier
-        guard let rec = SFSpeechRecognizer(locale: loc) else {
-            note = "No speech recogniser for \(name)."
-            return
-        }
-        guard rec.isAvailable else { note = "Speech recogniser for \(name) is unavailable."; return }
-        // Not every language ships an offline model (nl-NL does not, out of the
-        // box). Say so and stop, rather than falling back to Apple's servers.
-        guard rec.supportsOnDeviceRecognition else {
-            note = "No on-device model for \(name). Add it under System Settings ▸ Keyboard ▸ Dictation ▸ Edit Languages, then reopen DropMemo. Not sending audio to Apple."
-            return
-        }
-
-        let req = SFSpeechAudioBufferRecognitionRequest()
-        req.shouldReportPartialResults = true
-        req.requiresOnDeviceRecognition = true       // never off this machine
-        request = req
-
-        let input = engine.inputNode
-        // Tap with the node's OWN format — a hand-rolled one crashes CoreAudio.
-        input.installTap(onBus: 0, bufferSize: 1024, format: input.outputFormat(forBus: 0)) { buf, _ in
-            req.append(buf)
-        }
-        engine.prepare()
-        do { try engine.start() } catch {
-            note = "Couldn't start the microphone: \(error.localizedDescription)"
-            teardown()
-            return
-        }
-
-        isListening = true
-        task = rec.recognitionTask(with: req) { [weak self] result, error in
-            Task { @MainActor in
-                guard let self else { return }
-                if let result {
-                    self.push(result.bestTranscription.formattedString)
-                    if result.isFinal { self.stop() }
-                }
-                if error != nil { self.stop() }
-            }
-        }
-    }
-
-    /// base + heard, with one space between if the field didn't end in whitespace.
-    private func push(_ heard: String) {
-        guard !heard.isEmpty else { return }
-        let joiner = (base.isEmpty || base.last?.isWhitespace == true) ? "" : " "
-        emit?(base + joiner + heard)
-    }
-
-    func stop() {
-        guard isListening || engine.isRunning else { return }
-        isListening = false
-        request?.endAudio()
-        task?.finish()
-        teardown()
-    }
-
-    private func teardown() {
-        if engine.isRunning { engine.stop() }
-        engine.inputNode.removeTap(onBus: 0)
-        request = nil
-        task = nil
-    }
-}
-
 // MARK: - Model: owns the log + drives the Process
 
 @MainActor
@@ -205,6 +83,7 @@ final class PipelineModel: ObservableObject {
     static let shared = PipelineModel()
 
     @Published var audioURL: URL?
+    @Published var secondURL: URL?                    // optional: the same meeting, recorded on another device
     @Published var log: String = ""
     @Published var isRunning = false
     @Published var lastOutDir: String?
@@ -218,7 +97,7 @@ final class PipelineModel: ObservableObject {
     @Published var denoise = false
     @Published var diarize: DiarizeEngine = .pyannote
     @Published var asrModel: String = "1.7B"          // 0.6B = faster, 1.7B = accurate
-    @Published var language: String = "nl"            // hint for speech ASR (blank = auto)
+    @Published var language: String = ""              // hint for speech ASR (blank = auto, right for a mixed memo)
     @Published var transcriptText: String = ""        // optional: paste a transcript to force-align
     @Published var transcriptURL: URL?                // …or attach one from a file (fallback)
 
@@ -246,6 +125,11 @@ final class PipelineModel: ObservableObject {
     func accept(_ url: URL) {
         audioURL = url
         appendLine("• selected \(url.lastPathComponent)")
+    }
+
+    func acceptSecond(_ url: URL) {
+        secondURL = url
+        appendLine("• second recording: \(url.lastPathComponent)")
     }
 
     // MARK: config.yaml <-> UI
@@ -334,6 +218,10 @@ final class PipelineModel: ObservableObject {
         } else if let t = transcriptURL {
             args += ["--transcript", t.path]
         }
+
+        // A second recording of the same meeting: notetaker lines the two up on
+        // their words and also writes transcript_merged.md + disagreements.md.
+        if let second = secondURL { args += ["--second", second.path] }
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/bash")
@@ -426,16 +314,172 @@ final class PipelineModel: ObservableObject {
     private func appendLine(_ s: String) { log += s + "\n" }
 }
 
+// MARK: - Voice note: say the context instead of typing it
+
+/// The mic in the context box. Records the Mac's microphone to a 16 kHz WAV,
+/// transcribes it on-device with the same `speech` binary and ASR model the
+/// pipeline uses, and hands back the text. macOS Dictation is not involved
+/// (Tom has it off), and nothing leaves the Mac.
+@MainActor
+final class VoiceNote: ObservableObject {
+    enum State { case idle, starting, recording, transcribing }
+    @Published var state: State = .idle
+    @Published var problem: String?
+
+    private var recorder: AVAudioRecorder?
+    private var stopWhenStarted = false   // released before the mic was ready
+    private var onText: ((String) -> Void)?
+    private var model = "1.7B", language = ""
+
+    private var file: URL {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("DropMemo", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("voice-note.wav")
+    }
+
+    func start(model: String, language: String, onText: @escaping (String) -> Void) {
+        guard state == .idle else { return }
+        self.model = model; self.language = language; self.onText = onText
+        state = .starting
+        stopWhenStarted = false
+        problem = nil
+        AVCaptureDevice.requestAccess(for: .audio) { granted in
+            Task { @MainActor in self.begin(granted: granted) }
+        }
+    }
+
+    private func begin(granted: Bool) {
+        guard granted else {
+            state = .idle
+            problem = "Microphone access is off for DropMemo: System Settings → Privacy & Security → Microphone."
+            return
+        }
+        let settings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVSampleRateKey: 16_000,
+            AVNumberOfChannelsKey: 1,
+            AVLinearPCMBitDepthKey: 16,
+            AVLinearPCMIsFloatKey: false,
+            AVLinearPCMIsBigEndianKey: false,
+        ]
+        do {
+            let r = try AVAudioRecorder(url: file, settings: settings)
+            guard r.record() else { throw NSError(domain: "DropMemo", code: 1) }
+            recorder = r
+            state = .recording
+            if stopWhenStarted { stop() }
+        } catch {
+            state = .idle
+            problem = "Couldn't start the microphone: \(error.localizedDescription)"
+        }
+    }
+
+    func stop() {
+        if state == .starting { stopWhenStarted = true; return }
+        guard state == .recording, let r = recorder else { return }
+        r.stop()
+        recorder = nil
+        state = .transcribing
+        let (wav, model, language) = (file, model, language)
+        Task.detached {
+            let result = VoiceNote.transcribe(wav, model: model, language: language)
+            try? FileManager.default.removeItem(at: wav)
+            await MainActor.run {
+                self.state = .idle
+                switch result {
+                case .success(let text) where !text.isEmpty: self.onText?(text)
+                case .success: self.problem = "Didn't catch anything; try again a little closer."
+                case .failure(let e): self.problem = e.message
+                }
+            }
+        }
+    }
+
+    struct Failure: Error { let message: String }
+
+    /// `speech transcribe` prints progress, then "Result: <text>".
+    nonisolated static func transcribe(_ wav: URL, model: String,
+                                       language: String) -> Result<String, Failure> {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        var args = ["speech", "transcribe", wav.path, "--model", model]
+        let lang = language.trimmingCharacters(in: .whitespaces)
+        if !lang.isEmpty { args += ["--language", lang] }
+        proc.arguments = args
+        // A GUI app gets the bare PATH; process.sh does the same for the pipeline.
+        var env = ProcessInfo.processInfo.environment
+        env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + (env["PATH"] ?? "/usr/bin:/bin")
+        proc.environment = env
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = pipe
+        do { try proc.run() } catch {
+            return .failure(Failure(message: "Couldn't run `speech`: \(error.localizedDescription)"))
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
+        let out = String(data: data, encoding: .utf8) ?? ""
+        if let line = out.components(separatedBy: "\n").last(where: { $0.hasPrefix("Result:") }) {
+            return .success(String(line.dropFirst("Result:".count))
+                .trimmingCharacters(in: .whitespaces))
+        }
+        return .failure(Failure(message: "Transcription failed: "
+            + (out.components(separatedBy: "\n").last(where: { !$0.isEmpty }) ?? "no output")))
+    }
+}
+
+/// Click to start and click again to stop, or hold it and talk, letting go to stop.
+struct VoiceNoteButton: View {
+    @ObservedObject var note: VoiceNote
+    let start: () -> Void
+    @State private var pressedAt: Date?
+    @State private var startedThisPress = false
+
+    var body: some View {
+        Group {
+            switch note.state {
+            case .transcribing:
+                ProgressView().controlSize(.small)
+            default:
+                Image(systemName: note.state == .idle ? "mic.fill" : "stop.circle.fill")
+                    .font(.system(size: 15))
+                    .foregroundColor(note.state == .idle ? .secondary : .red)
+            }
+        }
+        .frame(width: 26, height: 26)
+        .contentShape(Rectangle())
+        .gesture(DragGesture(minimumDistance: 0)
+            .onChanged { _ in
+                guard pressedAt == nil else { return }
+                pressedAt = Date()
+                startedThisPress = note.state == .idle
+                if startedThisPress { start() } else { note.stop() }
+            }
+            .onEnded { _ in
+                let held = Date().timeIntervalSince(pressedAt ?? Date())
+                pressedAt = nil
+                if startedThisPress && held > 0.5 { note.stop() }   // hold to talk
+            })
+        .help(note.state == .idle
+              ? "Say the context: click to start and again to stop, or hold while you talk."
+              : "Stop and transcribe")
+        .disabled(note.state == .transcribing)
+    }
+}
+
 // MARK: - View
 
 struct ContentView: View {
     @ObservedObject var m = PipelineModel.shared
+    @StateObject private var voiceNote = VoiceNote()
     @State private var dropHighlight = false
-    @StateObject private var dictation = Dictation()
+    @State private var secondHighlight = false
 
     var body: some View {
         VStack(spacing: 12) {
             dropZone
+            secondRow
             roster
             controls
             transcriptRow
@@ -443,7 +487,7 @@ struct ContentView: View {
             statusBar
         }
         .padding(16)
-        .frame(minWidth: 580, minHeight: 740)
+        .frame(minWidth: 580, minHeight: 780)
     }
 
     private var dropZone: some View {
@@ -474,6 +518,33 @@ struct ContentView: View {
         }
     }
 
+    /// The second drop slot: the same meeting recorded on another device.
+    private var secondRow: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "waveform.badge.plus").foregroundColor(.secondary)
+            Text(m.secondURL.map { "Second recording: \($0.lastPathComponent)" }
+                 ?? "Second recording of the same meeting (optional): drop it here")
+                .font(.caption).foregroundColor(.secondary)
+                .lineLimit(1).truncationMode(.middle)
+            Spacer()
+            Button("Choose…") { pickFile(second: true) }
+            if m.secondURL != nil {
+                Button("Clear") { m.secondURL = nil }
+            }
+        }
+        .padding(.horizontal, 10).padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(style: StrokeStyle(lineWidth: 1, dash: [5]))
+                .foregroundColor(secondHighlight ? .accentColor : .secondary.opacity(0.4))
+        )
+        .onDrop(of: [.fileURL, .audio, .item], isTargeted: $secondHighlight) { providers in
+            handleDrop(providers, second: true)
+        }
+        .help("The same meeting recorded on another phone or laptop. The louder recording becomes the transcript; the other fills its gaps, and disagreements.md lists where the two differ.")
+        .disabled(m.isRunning)
+    }
+
     private var roster: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("Who's in the meeting  (saved to config.yaml)")
@@ -483,39 +554,33 @@ struct ContentView: View {
             TextEditor(text: $m.context)
                 .font(.system(.caption, design: .default))
                 .frame(height: 56)
-                .overlay(RoundedRectangle(cornerRadius: 5)
-                    .stroke(dictation.isListening ? Color.red.opacity(0.7) : Color.secondary.opacity(0.3)))
+                .overlay(RoundedRectangle(cornerRadius: 5).stroke(.secondary.opacity(0.3)))
                 .overlay(alignment: .topLeading) {
-                    if m.context.isEmpty && !dictation.isListening {
-                        Text("Optional context: roles, who dials in, recurring topics…")
+                    if m.context.isEmpty {
+                        Text("Optional context: roles, who dials in, recurring topics… or use the mic")
                             .font(.caption).foregroundColor(.secondary)
                             .padding(.horizontal, 5).padding(.vertical, 4).allowsHitTesting(false)
                     }
                 }
-                .overlay(alignment: .bottomTrailing) { micButton }
-            if let n = dictation.note {
-                Text(n).font(.caption2).foregroundColor(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                .overlay(alignment: .bottomTrailing) {
+                    VoiceNoteButton(note: voiceNote) {
+                        voiceNote.start(model: m.asrModel, language: m.language) { text in
+                            let ctx = m.context.trimmingCharacters(in: .whitespacesAndNewlines)
+                            m.context = ctx.isEmpty ? text : ctx + " " + text
+                        }
+                    }
+                    .padding(2)
+                }
+            if let problem = voiceNote.problem {
+                Text(problem).font(.caption).foregroundColor(.orange)
+            } else if voiceNote.state == .recording {
+                Text("● Listening… click the mic to stop, or let go if you're holding it.")
+                    .font(.caption).foregroundColor(.red)
+            } else if voiceNote.state == .transcribing {
+                Text("Transcribing on this Mac…").font(.caption).foregroundColor(.secondary)
             }
         }
         .disabled(m.isRunning)
-    }
-
-    /// Speak the context instead of typing it. On-device only, in the system
-    /// language (see Dictation.locale).
-    private var micButton: some View {
-        Button {
-            dictation.toggle(current: m.context) { text in
-                PipelineModel.shared.context = text
-            }
-        } label: {
-            Image(systemName: dictation.isListening ? "stop.circle.fill" : "mic.circle")
-                .font(.system(size: 16))
-                .foregroundColor(dictation.isListening ? .red : .secondary)
-        }
-        .buttonStyle(.plain)
-        .help(dictation.isListening ? "Stop dictating" : "Dictate the context (on-device)")
-        .padding(4)
     }
 
     private var controls: some View {
@@ -556,7 +621,7 @@ struct ContentView: View {
     private var transcriptRow: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
-                Text("Transcript (optional — paste a Voice Memos export to force-align)")
+                Text("Transcript (optional, and only in the memo's own language; leave empty to transcribe)")
                     .font(.caption).foregroundColor(.secondary)
                 Spacer()
                 Button("Attach file…") { pickTranscript() }
@@ -571,7 +636,7 @@ struct ContentView: View {
                 .overlay(alignment: .topLeading) {
                     if m.transcriptText.isEmpty {
                         Text(m.transcriptURL.map { "Using file: \($0.lastPathComponent)" }
-                             ?? "Paste here for better text (especially non-English); leave empty to let speech transcribe.")
+                             ?? "Leave empty to transcribe the memo. Only paste a transcript in the memo's own language.")
                             .font(.caption).foregroundColor(.secondary)
                             .padding(.horizontal, 5).padding(.vertical, 4).allowsHitTesting(false)
                     }
@@ -624,8 +689,11 @@ struct ContentView: View {
 
     // MARK: drop / pick
 
-    private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
+    private func handleDrop(_ providers: [NSItemProvider], second: Bool = false) -> Bool {
         guard let p = providers.first else { return false }
+        let accept: @MainActor (URL) -> Void = { url in
+            if second { PipelineModel.shared.acceptSecond(url) } else { PipelineModel.shared.accept(url) }
+        }
         // Prefer a real file representation: this materializes file *promises*
         // (how Voice Memos vends a recording) into a temp file, not just plain
         // file-URL drags. Pick an audio-conforming type id, else a file-url.
@@ -634,15 +702,15 @@ struct ContentView: View {
                   ?? ids.first { $0 == UTType.fileURL.identifier }
         if let id = fileId {
             p.loadFileRepresentation(forTypeIdentifier: id) { url, _ in
-                guard let url, let stable = Self.intoInbox(url) else { return }
-                Task { @MainActor in PipelineModel.shared.accept(stable) }
+                guard let url, let stable = Self.intoInbox(url, second: second) else { return }
+                Task { @MainActor in accept(stable) }
             }
             return true
         }
         if p.canLoadObject(ofClass: URL.self) {       // Finder file drag
             _ = p.loadObject(ofClass: URL.self) { url, _ in
                 guard let url, url.isFileURL else { return }
-                Task { @MainActor in PipelineModel.shared.accept(url) }
+                Task { @MainActor in accept(url) }
             }
             return true
         }
@@ -650,9 +718,12 @@ struct ContentView: View {
     }
 
     /// The URL from loadFileRepresentation is temporary and deleted once the
-    /// handler returns, so copy it somewhere stable before using it.
-    private static func intoInbox(_ src: URL) -> URL? {
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("DropMemo", isDirectory: true)
+    /// handler returns, so copy it somewhere stable before using it. The second
+    /// recording gets its own folder: two phones both call a memo "New Recording",
+    /// and one copy must not overwrite the other.
+    private static func intoInbox(_ src: URL, second: Bool = false) -> URL? {
+        var dir = FileManager.default.temporaryDirectory.appendingPathComponent("DropMemo", isDirectory: true)
+        if second { dir = dir.appendingPathComponent("second", isDirectory: true) }
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let dest = dir.appendingPathComponent(src.lastPathComponent)
         try? FileManager.default.removeItem(at: dest)
@@ -660,13 +731,13 @@ struct ContentView: View {
         catch { return nil }
     }
 
-    private func pickFile() {
+    private func pickFile(second: Bool = false) {
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
         panel.allowedContentTypes = [.audio, .mpeg4Audio, .wav, .mp3]
         if panel.runModal() == .OK, let url = panel.url {
-            m.accept(url)
+            if second { m.acceptSecond(url) } else { m.accept(url) }
         }
     }
 

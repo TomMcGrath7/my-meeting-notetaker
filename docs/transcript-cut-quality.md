@@ -78,7 +78,60 @@ exactly by force-aligning that chunk's assigned text against its audio.
   transcript is untimed, so `align_words()` splits it by word **count**
   proportionally (assumes constant speaking rate). Smaller chunks bound the
   drift but don't remove it. Fixing properly needs timed source text or a
-  per-chunk realignment that re-estimates the split — not worth it yet.
+  per-chunk realignment that re-estimates the split.
+
+  **The realignment is built (plan 321); its verdict is below.** After pass one, a chunk with coverage at or under 90% whose tail
+  collapsed hands that tail to the next chunk's text, and only those two chunks
+  are aligned again, at most `REALIGN_PASSES = 2` times. A tail is a run of
+  three words under 0.05s from which the rest of the chunk is packed at 6+ words
+  a second (`collapsed_tail()`). The rate test was added after looking at the
+  saved run: runs of three zero-length words sit all through healthy speech
+  (the aligner's tick is 0.08s, so a short word often gets zero), and the first
+  such run alone would have moved half of a good chunk's text.
+
+  Measured so far (`notetaker.py align-report`, no model run):
+
+  | what | words | under 0.05s | worst coverage |
+  |---|---|---|---|
+  | `out-20260702-001651/pipeline.json`, the only saved EdTech run (300s chunks, from before the 120s fix) | 8321 | 3400, **40.9%** | 46% (chunk 3) |
+  | `tests/fixtures/align_sample.txt`, one healthy 100s chunk | 231 | 85, **36.8%** | 89% |
+  | the 120s re-align this doc's ~36% came from | not saved | ~36% | |
+
+  The fixture matters more than the table's first line: a chunk with no
+  collapse and no tail (`collapsed_tail()` finds none in it) is already at 37%.
+  Most near-zero words are short words landing on one tick inside well-placed
+  speech, not a crushed tail, so this pass alone is unlikely to reach 10%. On
+  the saved 300s run the detector finds tails in chunks 3, 5, 9 and 10 (567,
+  141, 4 and 94 words); chunk 11 is over 90% coverage and chunk 12 has no
+  neighbour.
+
+  **Decision rule, set before the run:** ship if the final near-zero share is
+  under 10% with `--strict` passing and the segment count after
+  `tidy_segments()` up by no more than 10%; otherwise record the pass-one and
+  final numbers here and accept the residual. `run --align-report` prints both
+  numbers from a single run (the segment counts are taken on raw labels, before
+  the LLM relabel, the same way on both sides).
+
+  **Verdict (live run, 2026-11-06): the residual is accepted.** One `run
+  --transcript --align-report --strict --no-notes` on the EdTech call's
+  `audio.wav` (120s chunks, 29 of them, about 4 minutes). The
+  source text was the saved run's own 8321 words, since the original pasted
+  transcript was not kept.
+
+  | what | near-zero | worst coverage | segments after tidy |
+  |---|---|---|---|
+  | pass one | **27.6%** (2249 of 8157) | 80% (chunk 22) | 3 |
+  | final, after the realign | **27.6%** | 80% | 3 |
+
+  The realign fired once (chunks 22 and 23, 30 words moved) and did not move the
+  total. No chunk collapsed, so `--strict` held. The earlier 120s figure (~36%)
+  was on the original pasted text, so the two are not a clean before and after;
+  within this run, pass one and final are, and the second pass adds nothing
+  measurable. The near-zero
+  words are short words on a single aligner tick inside well-placed speech, as
+  the fixture predicted, and one chunk (27, 52:00) sits at 73.5% on its own.
+  The pass stays in, since it is cheap and harmless, but it is not the
+  lever. Timed source text is.
 - **Mid-sentence cuts at genuine speaker changes** remain (see rejected
   sentence-snapping). They read slightly rough but are correctly attributed.
 - **ASR text errors** ("loci method" → "Loki", "NotebookLM" → "no Boog LM") are
