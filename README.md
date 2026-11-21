@@ -480,14 +480,18 @@ current tab if it has no recording yet, and gets a tab of its own otherwise.
 
 **Several memos: tabs and a queue.** Each memo has its own tab, holding its own
 recording, participants, context and controls; **+** (⌘T) opens another and
-copies the backend, model and ASR settings, but not the recording or roster.
-**Process** on an idle app starts at once; while something runs, the button
-reads **Add to queue**. Queued memos run one at a time, top to bottom, so only
+copies the controls (backend, model, denoise, diarizer, ASR size, language),
+but not the recording or roster. **Process** (⌘Return) on an idle app starts at
+once; while something runs or waits, the button reads **Add to queue**. Queued memos run one at a time, top to bottom, so only
 one pipeline (one ASR model, one local LLM) is ever in RAM. Each memo's roster
 is written to `config.yaml` right before that memo starts, so a queued memo can
 still be edited: click its row on the **Jobs** tab to open it. Jobs also lists
 every memo's status, opens a finished one's notes, and runs a failed one again.
-**Stop** ends only the running memo and pauses the queue until **Resume queue**.
+**Stop** ends only the running memo and pauses the queue until **Resume queue**
+(on the Jobs tab, or on a queued memo's tab); processing a memo when nothing
+else is queued starts it anyway. The context mic is off while a memo
+processes, and a queued memo waits for a voice note to finish transcribing:
+each loads its own speech model.
 The queue lives in memory: quitting with work left asks first, then forgets it.
 
 The **context** box has a mic button: click it, say what the call is about, click

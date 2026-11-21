@@ -1,8 +1,10 @@
 // DropMemo — a thin SwiftUI front-end over scripts/process.sh.
 //
-// One window: drag a recording in (or pick one), set who was in the meeting and
-// the controls, watch the pipeline's stdout stream live, and on success the
-// out-dir is revealed in Finder with notes.md opened. It is deliberately NOT a
+// One window with a tab per memo: drag a recording in (or pick one), set who was
+// in the meeting and the controls, and queue it. A Jobs tab lists every memo;
+// queued memos run one at a time (one pipeline in RAM), each streaming its
+// stdout into its own tab, and on success the out-dir is revealed in Finder
+// with notes.md opened. It is deliberately NOT a
 // reimplementation of the pipeline — every run shells out to scripts/process.sh
 // (the single source of truth) so the app and the Voice Memos Shortcut behave
 // identically.
@@ -147,9 +149,11 @@ final class Job: ObservableObject, Identifiable {
     @Published var participants: String = ""
     @Published var context: String = ""
 
-    @Published var status: JobStatus = .draft
+    // The tab strip, the Jobs page and the queue counts observe JobQueue, not
+    // each Job, so these two tell the queue when they change.
+    @Published var status: JobStatus = .draft { didSet { JobQueue.shared.objectWillChange.send() } }
+    @Published var isOpen = true { didSet { JobQueue.shared.objectWillChange.send() } }   // has a tab in the strip
     @Published var log: String = ""
-    @Published var isOpen = true                      // has a tab in the strip
 
     /// Drafts and queued jobs can still be edited: config.yaml and the flags
     /// are only built from these fields when the job starts.
@@ -211,8 +215,14 @@ final class JobQueue: ObservableObject {
     /// the stopped one exits. Resume clears it.
     @Published var paused = false
 
+    /// While a context voice note is being transcribed its ASR model is in
+    /// memory, so no pipeline starts until it is done.
+    @Published var voiceNoteBusy = false {
+        didSet { if !voiceNoteBusy { startNextIfIdle() } }
+    }
+
     private var task: Process?
-    private var current: Job?
+    @Published private(set) var current: Job?
     private var stopped = false
 
     init() {
@@ -280,6 +290,9 @@ final class JobQueue: ObservableObject {
     func enqueue(_ j: Job) {
         // A draft joins the queue; a finished job (done, failed, stopped) runs again.
         guard j.audioURL != nil, j.status == .draft || j.status.isFinished else { return }
+        // Asking for this one memo when nothing else waits is a fresh start,
+        // not a request to carry on the paused queue.
+        if paused, current == nil, queuedCount == 0 { paused = false }
         j.status = .queued
         j.appendLine("• queued")
         startNextIfIdle()
@@ -311,7 +324,7 @@ final class JobQueue: ObservableObject {
     /// The one place a run starts, so two pipelines (two ASR models, two LLMs)
     /// never sit in RAM at once.
     private func startNextIfIdle() {
-        guard current == nil, !paused,
+        guard current == nil, !paused, !voiceNoteBusy,
               let next = jobs.first(where: { $0.status == .queued }) else { return }
         run(next)
     }
@@ -364,7 +377,7 @@ final class JobQueue: ObservableObject {
     // MARK: run
 
     private func run(_ j: Job) {
-        guard let audio = j.audioURL else { j.status = .draft; return }
+        guard let audio = j.audioURL else { j.status = .draft; startNextIfIdle(); return }
         guard FileManager.default.isExecutableFile(atPath: Repo.processSh) else {
             j.appendLine("✗ can't find process.sh at \(Repo.processSh)")
             j.appendLine("  Set DROPMEMO_REPO, or rebuild so DMRepoPath points at your checkout.")
@@ -422,11 +435,19 @@ final class JobQueue: ObservableObject {
         proc.standardError = pipe
         pipe.fileHandleForReading.readabilityHandler = { [weak j] handle in
             let data = handle.availableData
-            guard !data.isEmpty, let chunk = String(data: data, encoding: .utf8) else { return }
+            guard !data.isEmpty else { return }
+            let chunk = String(decoding: data, as: UTF8.self)   // never drop a chunk over one bad byte
             Task { @MainActor in j?.append(chunk) }
         }
-        proc.terminationHandler = { p in
-            Task { @MainActor in JobQueue.shared.finished(status: p.terminationStatus) }
+        // Drain what is still in the pipe before judging the run: the last chunk,
+        // with OUT_DIR=, can arrive after the process has exited.
+        proc.terminationHandler = { [weak j] p in
+            pipe.fileHandleForReading.readabilityHandler = nil
+            let tail = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            Task { @MainActor in
+                if !tail.isEmpty { j?.append(tail) }
+                JobQueue.shared.finished(status: p.terminationStatus)
+            }
         }
 
         self.task = proc
@@ -472,7 +493,6 @@ final class JobQueue: ObservableObject {
     }
 
     private func finished(status: Int32) {
-        (task?.standardOutput as? Pipe)?.fileHandleForReading.readabilityHandler = nil
         task = nil
         guard let j = current else { return }
         current = nil
@@ -576,12 +596,14 @@ final class VoiceNote: ObservableObject {
         r.stop()
         recorder = nil
         state = .transcribing
+        JobQueue.shared.voiceNoteBusy = true
         let (wav, model, language) = (file, model, language)
         Task.detached {
             let result = VoiceNote.transcribe(wav, model: model, language: language)
             try? FileManager.default.removeItem(at: wav)
             await MainActor.run {
                 self.state = .idle
+                JobQueue.shared.voiceNoteBusy = false
                 switch result {
                 case .success(let text) where !text.isEmpty: self.onText?(text)
                 case .success: self.problem = "Didn't catch anything; try again a little closer."
@@ -627,6 +649,7 @@ final class VoiceNote: ObservableObject {
 /// Click to start and click again to stop, or hold it and talk, letting go to stop.
 struct VoiceNoteButton: View {
     @ObservedObject var note: VoiceNote
+    var blocked = false
     let start: () -> Void
     @State private var pressedAt: Date?
     @State private var startedThisPress = false
@@ -656,10 +679,12 @@ struct VoiceNoteButton: View {
                 pressedAt = nil
                 if startedThisPress && held > 0.5 { note.stop() }   // hold to talk
             })
-        .help(note.state == .idle
+        .help(blocked && note.state == .idle
+              ? "The mic is off while a memo is processing: it would load a second speech model."
+              : note.state == .idle
               ? "Say the context: click to start and again to stop, or hold while you talk."
               : "Stop and transcribe")
-        .disabled(note.state == .transcribing)
+        .disabled(note.state == .transcribing || (blocked && note.state == .idle))
     }
 }
 
@@ -928,7 +953,8 @@ struct MemoView: View {
                     }
                 }
                 .overlay(alignment: .bottomTrailing) {
-                    VoiceNoteButton(note: voiceNote) {
+                    // Off while a pipeline runs: the mic loads its own ASR model.
+                    VoiceNoteButton(note: voiceNote, blocked: q.isRunning) {
                         voiceNote.start(model: job.asrModel, language: job.language) { [job] text in
                             let ctx = job.context.trimmingCharacters(in: .whitespacesAndNewlines)
                             job.context = ctx.isEmpty ? text : ctx + " " + text
@@ -1036,9 +1062,10 @@ struct MemoView: View {
                 ProgressView().controlSize(.small)
                 Text("Processing…").foregroundColor(.secondary)
             case .queued:
-                Text(q.isRunning || q.paused
-                     ? "Queued: starts when the jobs ahead of it finish. You can still edit it."
-                     : "Queued").foregroundColor(.secondary)
+                Text(q.paused && !q.isRunning
+                     ? "Queued, but the queue is paused after a Stop."
+                     : "Queued: starts when the memos ahead of it finish. You can still edit it.")
+                    .foregroundColor(.secondary)
             case .done(let out):
                 Text("Done → \(out)").foregroundColor(.secondary)
                     .lineLimit(1).truncationMode(.head)
@@ -1047,17 +1074,19 @@ struct MemoView: View {
             case .stopped:
                 Text("Stopped").foregroundColor(.secondary)
             case .draft:
-                Text(q.isRunning ? "Another memo is processing; this one will wait its turn." : "Ready")
+                Text(q.isRunning ? "Another memo is processing; Add to queue runs this one after it." : "Ready")
                     .foregroundColor(.secondary)
             }
             Spacer()
             switch job.status {
             case .draft:
                 // Starts straight away when nothing is running; otherwise waits.
-                Button(q.isRunning || q.queuedCount > 0 || q.paused ? "Add to queue" : "Process") { q.enqueue(job) }
-                    .keyboardShortcut(.return, modifiers: [])
+                // ⌘Return, not Return: Return belongs to the text fields above.
+                Button(q.isRunning || q.queuedCount > 0 ? "Add to queue" : "Process") { q.enqueue(job) }
+                    .keyboardShortcut(.return, modifiers: [.command])
                     .disabled(job.audioURL == nil)
             case .queued:
+                if q.paused && !q.isRunning { Button("Resume queue") { q.resume() } }
                 Button("Unqueue") { q.unqueue(job) }
             case .running:
                 Button("Stop") { q.stop() }
@@ -1075,7 +1104,7 @@ struct MemoView: View {
     // MARK: drop / pick
 
     private func handleDrop(_ providers: [NSItemProvider], second: Bool = false) -> Bool {
-        guard let p = providers.first else { return false }
+        guard job.isEditable, let p = providers.first else { return false }
         let accept: @MainActor (URL) -> Void = { [job] url in
             if second { job.acceptSecond(url) } else { job.accept(url) }
         }
@@ -1152,19 +1181,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// without a word (and orphan a running pipeline). Ask first, and stop the
     /// running job's process tree if the answer is yes.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        do {
-            let q = JobQueue.shared
-            guard q.isRunning || q.queuedCount > 0 else { return .terminateNow }
-            let alert = NSAlert()
-            alert.messageText = "Quit DropMemo with work left?"
-            alert.informativeText = (q.isRunning ? "A memo is still processing and will be stopped. " : "")
-                + (q.queuedCount > 0 ? "\(q.queuedCount) queued memo(s) will be forgotten." : "")
-            alert.addButton(withTitle: "Keep running")
-            alert.addButton(withTitle: "Quit")
-            guard alert.runModal() == .alertSecondButtonReturn else { return .terminateCancel }
-            q.stop()
-            return .terminateNow
-        }
+        let q = JobQueue.shared
+        guard q.isRunning || q.queuedCount > 0 else { return .terminateNow }
+        let alert = NSAlert()
+        alert.messageText = "Quit DropMemo with work left?"
+        alert.informativeText = (q.isRunning ? "A memo is still processing and will be stopped. " : "")
+            + (q.queuedCount > 0 ? "\(q.queuedCount) queued memo(s) will be forgotten." : "")
+        alert.addButton(withTitle: "Keep running")
+        alert.addButton(withTitle: "Quit")
+        guard alert.runModal() == .alertSecondButtonReturn else { return .terminateCancel }
+        q.stop()
+        return .terminateNow
     }
 }
 
