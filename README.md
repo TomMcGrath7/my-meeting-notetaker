@@ -453,9 +453,9 @@ Override via env: `LLM_BACKEND` (default `claude-cli`), `CLAUDE_MODEL` (default
 runs it as `--llm-backend ollama` (`LLM_BACKEND=ollama` is the same thing).
 Append `--llm-backend openai` to force the older call.
 
-**DropMemo** (macOS app) — one window: drag a memo onto it (or use the file
-picker), set **who's in the meeting** (the participants + context fields write
-straight to `config.yaml`, and are pre-filled from it on launch), pick the
+**DropMemo** (macOS app) — one window, one tab per memo: drag a memo onto it (or use the file
+picker), set **who's in the meeting** (the participants + context fields are written
+to `config.yaml` when that memo starts, and the first tab is pre-filled from it on launch), pick the
 backend / LLM model / denoise / diarize-engine / **ASR size** / **language**,
 optionally **attach a transcript** (a Voice Memos export, force-aligned to
 the audio; only one in the memo's own language, since Voice Memos may give an
@@ -475,7 +475,30 @@ scripts/build_dropmemo.sh --install   # also replace /Applications/DropMemo.app
 ```
 
 It registers as a handler for `.m4a/.wav/.mp3`, so **Open With ▸ DropMemo** and
-dropping a memo on its Dock icon both work.
+dropping a memo on its Dock icon both work. A file opened that way fills the
+current tab if it has no recording yet, and gets a tab of its own otherwise.
+
+**Several memos: tabs and a queue.** Each memo has its own tab, holding its own
+recording, participants, context and controls; **+** (⌘T) opens another and
+copies the controls (backend, model, denoise, diarizer, ASR size, language),
+but not the recording or roster. **Process** (⌘Return) on an idle app starts at
+once; while something runs or waits, the button reads **Add to queue**. Queued memos run one at a time, top to bottom, so only
+one pipeline (one ASR model, one local LLM) is ever in RAM. Each memo's roster
+is written to `config.yaml` right before that memo starts, so a queued memo can
+still be edited: click its row on the **Jobs** tab to open it. Jobs also lists
+every memo's status, opens a finished one's notes, and runs a failed one again.
+**Stop** ends only the running memo and pauses the queue until **Resume queue**
+(on the Jobs tab, or on a queued memo's tab); processing a memo when nothing
+else is queued starts it anyway. The context mic is off while a memo
+processes, and a queued memo waits for a voice note to finish transcribing:
+each loads its own speech model.
+The queue lives in memory: quitting with work left asks first, then forgets it.
+
+The **context** box has a mic button: click it, say what the call is about, click
+again to stop. The note is transcribed on this Mac with the same speech model the
+pipeline uses and appended to whatever is already in the box; nothing leaves the
+machine. First click prompts for Microphone access. Because the app is ad-hoc
+signed, macOS may re-prompt after a rebuild.
 
 The **context** box has a mic button: click it, say what the call is about, click
 again to stop. The note is transcribed on this Mac with the same speech model the
