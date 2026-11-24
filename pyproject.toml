@@ -1,0 +1,22 @@
+[project]
+name = "my-meeting-notetaker"
+version = "0.1.0"
+description = "On-device post-meeting note taker for macOS / Apple Silicon"
+readme = "README.md"
+# llm-seam needs 3.10+; the macOS system python3 (3.9) is not enough.
+requires-python = ">=3.10"
+dependencies = [
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+# OPTIONAL, and only installable with access to the private llm-seam repo.
+# Adds --llm-backend claude-cli and the context-sizing --llm-backend ollama;
+# see requirements-llm-seam.txt and "Do you have access to llm-seam?" in the README.
+llm-seam = [
+    "llm-seam @ git+https://github.com/TomMcGrath7/llm-seam@v0.12.0",
+]
+
+[tool.uv]
+# notetaker.py is a script, not a package: uv only manages its environment.
+package = false
