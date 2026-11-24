@@ -3,7 +3,7 @@
 # process.sh — the one entry point for turning a recording into notes.
 #
 # This is the SINGLE SOURCE OF TRUTH that both the DropMemo macOS app and the
-# Voice Memos Shortcut call. It wraps the repo's venv python + notetaker.py with
+# Voice Memos Shortcut call. It wraps `uv run` + notetaker.py with
 # Tom's defaults (Claude subscription backend, a fresh timestamped out-dir) so callers
 # only ever pass an audio path. Any extra flags are forwarded verbatim to
 # notetaker.py, so `--denoise`, `--language nl`, `--diarize-engine sortformer`,
@@ -42,7 +42,12 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-PY="$REPO/.venv/bin/python3"
+# uv owns the environment (pyproject.toml + uv.lock): `uv run` builds or repairs
+# .venv on demand, so a deleted venv no longer stops a recording. Until
+# 2026-11-25 this was a hand-made pip venv, and when .venv vanished every run
+# died on "venv python not found". The llm-seam extra is included because the
+# default backend (claude-cli) needs it.
+UV="$(command -v uv || true)"
 NOTETAKER="$REPO/notetaker.py"
 
 # --- args --------------------------------------------------------------------
@@ -56,9 +61,9 @@ if [[ ! -f "$AUDIO" ]]; then
   echo "error: audio file not found: $AUDIO" >&2
   exit 1
 fi
-if [[ ! -x "$PY" ]]; then
-  echo "error: venv python not found at $PY" >&2
-  echo "       run:  python3 -m venv .venv && .venv/bin/pip install -r requirements.txt" >&2
+if [[ -z "$UV" ]]; then
+  echo "error: uv not found on PATH" >&2
+  echo "       run:  brew install uv" >&2
   exit 1
 fi
 
@@ -115,7 +120,7 @@ echo "  out-dir : $OUT_DIR"
 echo
 
 # -u keeps python unbuffered so the app's live log view streams in real time.
-"$PY" -u "$NOTETAKER" "${ARGS[@]}"
+"$UV" run --project "$REPO" --extra llm-seam --quiet python -u "$NOTETAKER" "${ARGS[@]}"
 
 echo
 echo "OUT_DIR=$OUT_DIR"

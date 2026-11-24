@@ -48,11 +48,12 @@ brew install soniqo/tap/speech
 # 2. ffmpeg for audio normalisation
 brew install ffmpeg
 
-# 3. python deps (just PyYAML; everything else is stdlib)
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
+# 3. python deps (just PyYAML; everything else is stdlib), managed by uv
+brew install uv
+uv sync                     # makes .venv from pyproject.toml + uv.lock
 #    Optional, see "Do you have access to llm-seam?" below:
-# .venv/bin/pip install -r requirements-llm-seam.txt
+# uv sync --extra llm-seam
+#    No uv? pip still works: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 # 4. LLM credentials — cloud (text only leaves device):
 export ANTHROPIC_API_KEY=sk-ant-...
@@ -75,17 +76,20 @@ server's context window stops with an error that says what to set on the
 server (see [Long meetings](#long-meetings-on-a-local-model-context-window)).
 `--llm-backend anthropic` and `--llm-backend openai` never needed it.
 
-**With access:** build the venv on Python 3.10 or newer (llm-seam requires it;
-the macOS system `python3` is 3.9 and will not do), then add the second file:
+**With access:** add the `llm-seam` extra. uv picks a Python 3.10 or newer by
+itself (llm-seam requires it; the macOS system `python3` is 3.9 and will not do):
 
 ```bash
-python3.12 -m venv .venv          # any python >= 3.10
-.venv/bin/pip install -r requirements.txt -r requirements-llm-seam.txt
+uv sync --extra llm-seam
 ```
 
 That pins llm-seam to a release tag (`v0.12.0`; the context-size option the
 notetaker needs arrived in `v0.8.0`). With llm-seam checked out beside this repo,
-`.venv/bin/pip install -e ../llm-seam` follows that checkout instead.
+`uv pip install -e ../llm-seam` follows that checkout instead (until the next
+`uv sync`). `scripts/process.sh`, which DropMemo and the Shortcut call, runs
+through `uv run --extra llm-seam`, so it rebuilds `.venv` itself if it is ever
+deleted. When bumping the tag, change it in `pyproject.toml` and
+`requirements-llm-seam.txt` together, then `uv lock`.
 
 ## Recording the meeting
 
